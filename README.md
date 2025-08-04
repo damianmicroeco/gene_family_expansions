@@ -1,5 +1,5 @@
 ## Preface
-The goal of this project is to determine whether gene family expansions are integral to context-dependent regulation of arbuscular mycorrhizal symbiosis. All files to replicate our analyese, with the exception of the HapMap SNP data, are available in this folder. For the computational environments, please find these at the end of this README file.
+The goal of this project is to determine whether gene family expansions are integral to context-dependent regulation of arbuscular mycorrhizal symbiosis. For the computational environments, please find these at the end of this README file.
 
 Please not that for this github repository, I am only including the scripts because a lot of the data is too big for GitHub's size requirements.
 However, you can find this data on Zenodo. Please find the citation below:
