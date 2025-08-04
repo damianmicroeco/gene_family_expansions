@@ -1,0 +1,780 @@
+---
+title: "Custom Duplicate Gene Classifier - All"
+author: "Damian Hernandez"
+date: "2023-10-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preface
+
+The goal of this script is to replicate the logic of duplicate_gene_classifier from MCScanX. The issue is that the original function in the package does not use a homology file from OrthoFinder which is what I need to do the duplication type comparisons. The reason is that we know what the orthogroups are based on OrthoFinder2 which is a better estimation than the pairwise BLAST hits used in the command line function.
+
+The assumed working directory is the script's jobs folder.
+
+## MCScanX logic
+
+Language direct from the paper:
+"""
+Classification of duplicate gene origins
+Genes within a single genome can be classified as singletons, dispersed duplicates, proximal duplicates, tandem duplicates and segmental/WGD duplicates depending on their copy number and genomic distribution. The following procedure is used to assign gene classes: (i) All genes are initially classified as ‘singletons’ and assigned gene ranks according to their order of appearance along chromosomes; (ii) BLASTP results are evaluated and the genes with BLASTP hits to other genes are re-labeled as ‘dispersed duplicates’; (iii) In any BLASTP hit, the two genes are re-labeled as ‘proximal duplicates’ if they have a difference of gene rank<20 (configurable); (iv) In any BLASTP hit, the two genes are re-labeled as ‘tandem duplicates’ if they have a difference of gene rank = 1; (v) MCScanX is executed. The anchor genes in collinear blocks are re-labeled as ‘WGD/segmental’. So, if a gene appears in multiple BLASTP hits, it will be assigned a unique class according to the order of priority: WGD/ segmental>tandem>proximal>dispersed.
+"""
+
+My summary:
+"""
+All genes are presumed singletons at the start (0). If orthologous genes co-occur somewhere else in the chromosome or in another chromosome with the same flanking orthogroups, then this is classified as WGD/segmental (4). If genes occur immediately next to each other, this is tandem (3). If genes are only separated by less than n genes (usually 10), then they are proximal (2). If they are separated by more than n genes or occur on other chromosomes not in a syntenic block, then they are dispersed (1).
+
+If genes have multiple classifications, the order of priority for classifications is:
+WGD>tandem>proximal>dispersed
+"""
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(ggplot2)
+library(car)
+library(Hmisc)
+```
+
+## General Purpose functions
+```{r}
+#Modified from https://www.r-bloggers.com/2012/11/expand-delimited-columns-in-r/ to expand the comma delimited columns in the Orthogroup metadata.
+#For some reason, I can't get cSplit in splitstackshape to do it correctly. Even though I call the species column with the orthogroup metadata, it keeps trying to split up the orthogroup ID column.
+
+#Function to expand data
+expand.delimited <- function(x, col1, col2, sep=",") {
+  rnum <- 1
+  expand_row <- function(y) {
+    factr <- y[col1]
+    strng <- toString(y[col2])
+    expand <- strsplit(strng, sep)[[1]]
+    num <- length(expand)
+    factor <- rep(factr,num)
+    return(as.data.frame(cbind(factor,expand),
+          row.names=seq(rnum:(rnum+num)-1)))
+    rnum <- (rnum+num)-1
+  }
+  expanded <- apply(x,1,expand_row)
+  df <- do.call("rbind", expanded)
+  names(df) <- c(names(x)[col1],names(x)[col2])
+  return(df)
+}
+```
+
+## Basic Metadata
+
+```{r}
+#get list of species that were in OrthoFinder analysis
+am_ortho_df = read.csv("../metadata/orthogroup_mannwhitney.csv")
+
+specs = colnames(am_ortho_df)[grepl("AM_", colnames(am_ortho_df))]
+
+#get list of AM orthogroups
+am_ortho = am_ortho_df$X[(am_ortho_df$mann_FDR <= 0.05) & (am_ortho_df$am_v_nm > 1)]
+```
+
+## Dataframe Management Iteration
+Here we will quantify the different duplication events that do not require MCScanX_h.
+
+```{r}
+#dir.create("../processed_data/duplication_tables")
+```
+
+```{r}
+for (spec in specs) {
+  ref_label = spec
+  spec = gsub("_refseq", "", spec)
+  
+  df_c = read.table(paste("../processed_data/",spec,"/",spec,".gff", sep = ""), sep = "\t")
+  colnames(df_c) = c("chrom", "gene", "start", "end")
+  
+  #get orthogroup classifications
+  orth_c = read.table("../metadata/Orthogroups.csv", sep = "\t", header = TRUE)
+  
+  #reduce orthogroup dataframe to species of interest
+  orth_c = orth_c[,c("X", ref_label)]
+  
+  #remove orthogroups that don't occur in the species
+  orth_c = orth_c[orth_c[, ref_label] != "",]
+  
+  #remove whitespace in species column
+  orth_c[,ref_label] = gsub('\\s+', '', orth_c[,ref_label])
+  
+  #expand gene id info into columns
+  orth_c = data.frame(expand.delimited(orth_c, "X", ref_label))
+  colnames(orth_c) = c("ortho", "gene")
+  
+  #use refseq ID as gene name to match gff file
+  orth_c = orth_c %>% 
+    separate(gene, c("gi_name", "gi", "ref", "gene", "blank"), "\\|") %>%
+    select(c(ortho, gene))
+  
+  #add orthogroup information to bed file
+  df_c = merge(df_c, orth_c, by = "gene", all.x = TRUE)
+  
+  #For now I am going to remove those with NAs in the ortho column and move on with doing the duplicate gene classification.
+  df_c = df_c[!is.na(df_c$ortho),]
+  
+  #for this round I am removing scaffolds that have less than three genes (i.e., the minimum for determining wgd/segmental duplication)
+  #discuss with Michelle if this is a good idea because it's unclear what kind of duplication event they would be part of.
+  chrom_count = df_c %>%
+    group_by(chrom) %>%
+    summarise(count = n())
+  
+  chrom_ok = chrom_count$chrom[chrom_count$count >= 3]
+  
+  df_c = df_c[df_c$chrom %in% chrom_ok,]
+  
+  #group by chromosome/scaffold
+  df_c = df_c %>%
+    group_by(chrom)
+  
+  #sort chromosome by gene start
+  df_c = df_c %>%
+    arrange(start, .by_group = TRUE)
+  
+  #remove mitochondrial/plastid chromosomes if there are any
+  df_c = df_c[!grepl("YP", df_c$gene),]
+  
+  #get gene ranks along chromosome
+  df_c = df_c %>%
+    mutate(rank = rank(start))
+  
+  #create empty columns to store booleans for the different gene duplication classes
+  df_c$singleton = TRUE
+  df_c$dispersed = FALSE
+  df_c$proximal = FALSE
+  df_c$tandem = FALSE
+  df_c$segmental = FALSE
+  
+  ## DISPERSED
+  #So, if a gene is dispersed it must have an orthogroup size larger than 1.
+  #We will first make all non-singleton orthogroups dispersed and then change the classification as we go through the tests for the higher priority classificiations
+  ortho_mult = df_c %>%
+    ungroup() %>%
+    group_by(ortho) %>%
+    summarise(count = n())
+  
+  ortho_mult_vec = ortho_mult$ortho[ortho_mult$count > 1]
+  
+  df_c$singleton[df_c$ortho %in% ortho_mult_vec] = FALSE
+  df_c$dispersed[df_c$ortho %in% ortho_mult_vec] = TRUE
+  
+  ## TANDEM/PROXIMAL
+  #Now we will reclassify the dispersed classifications is genes are tandem or proximal. Meaning that genes are either next to each other (tandem) or separated by 20 genes or less (proximal; original MCScanX paper, but can be changed).
+  
+  #make vector of orthogroups that cannot be tandem or proximal
+  #vector of orthogroups that only occur once on each chromosome (i.e., singleton or not possible to be close to each other since they are on separate chromosomes)
+  ortho_chrom_count = df_c %>%
+    ungroup() %>%
+    group_by(chrom, ortho) %>%
+    summarise(count = n()) %>%
+    ungroup() %>%
+    group_by(ortho) %>%
+    summarise(max = max(count))
+  
+  too_far = ortho_chrom_count$ortho[ortho_chrom_count$max == 1]
+  
+  #to speed up pairwise difference calculations, let's remove the ones that absolutely cannot be tandem/proximal
+  temp_df = df_c[!(df_c$ortho %in% too_far),]
+  
+  #for each orthogroup within a chromosome, make a numeric matrix of pairwise differences in rank
+  dist_df = data.frame(row = factor(), col = factor(), value = numeric())
+  for (c in unique(temp_df$chrom)) {
+    holder = temp_df[temp_df$chrom == c,]
+    for (o in unique(holder$ortho)) {
+      holder2 = holder[holder$ortho == o,]
+      ranks = holder2$rank
+      names(ranks) = holder2$gene
+      dist_hold = melt(as.matrix(dist(ranks)), varnames = c("row", "col"))
+      dist_df = rbind(dist_df, dist_hold)
+    }
+  }
+  
+  #remove self-comparisons
+  dist_df = dist_df[dist_df$value > 0,]
+  
+  #get minimum of each gene to make tandem/proximal classifications
+  dist_min = dist_df %>%
+    group_by(row) %>%
+    summarise(drank_min = min(value))
+  
+  #identify tandem (drank_min == 1) and proximal (1 < drank_min <= 20)
+  dist_min$dup_class = NA
+  
+  dist_min$dup_class[dist_min$drank_min == 1] = "tandem"
+  dist_min$dup_class[dist_min$drank_min > 1 & dist_min$drank_min <= 20] = "proximal"
+  
+  #get vectors of the two classes and change the df_c dataframe to reflect that
+  prox_vec = dist_min$row[dist_min$dup_class == "proximal"]
+  tand_vec = dist_min$row[dist_min$dup_class == "tandem"]
+  
+  df_c$proximal[df_c$gene %in% prox_vec] = TRUE
+  df_c$tandem[df_c$gene %in% tand_vec] = TRUE
+  df_c$dispersed[df_c$gene %in% prox_vec | df_c$gene %in% tand_vec] = FALSE
+  
+  #export bed file to test MCScanX_h
+  gff_c = df_c[,c(2,1,3,4)]
+  
+  #make pairwise homology file for MCScanX_h
+  hom_c = left_join(orth_c, orth_c, by = "ortho") %>%
+    filter(gene.x != gene.y)
+
+  hom_c = hom_c[hom_c$gene.x %in% df_c$gene,]
+  hom_c = hom_c[hom_c$gene.y %in% df_c$gene,]
+  hom_c = hom_c[,2:3]
+  
+  hom_c$gene.x = paste("dc0|", hom_c$gene.x, sep = "")
+  hom_c$gene.y = paste("dc0|", hom_c$gene.y, sep = "")
+  
+  hom_c$rand = sample(100, size = nrow(hom_c), replace = TRUE)
+    
+  #add appendices for names in both gff and homology files for MCScanX_h to do it's thing
+  gff_c1 = gff_c
+  gff_c1$chrom = paste("dc0_", gff_c1$chrom, sep = "")
+  gff_c1$gene = paste("dc0|", gff_c1$gene, sep = "")
+  
+  #write necessary files to disk
+  write.table(df_c, paste("../processed_data/duplication_tables/", spec, "_dupnowgd.csv", sep = ""), row.names = FALSE, quote = FALSE)
+  
+  write.table(gff_c1, paste("../processed_data/", spec, "/", spec, "_mcscan_input.gff", sep = ""), sep = "\t", col.names = FALSE, row.names = FALSE, quote = FALSE)
+  
+  write.table(hom_c, paste("../processed_data/", spec, "/", spec, "_mcscan_input.homology", sep = ""), sep = "\t", col.names = FALSE, row.names = FALSE, quote = FALSE)
+}
+```
+
+## Run MCScanX_h
+
+Note: I am not running the MCScanX_h analysis in this chunk because when trying to run on the Mac (where I can access Unix commands through the RStudio GUI), it fails to read in the homology files. Instead, I am running MCScanX_h in a for loop to be able to run on my WSL which I have tested and can read in the homology files and matches the results from my script testing with Daucus carota.
+
+I am leaving the code chunk here because it is the idea of what I'm doing.
+```{r}
+#for (spec in specs) {
+#  spec = gsub("_refseq", "", spec)
+#  setwd(paste("../processed_data/", spec, sep = ""))
+#  system(paste("../../MCScanX/MCScanX_h ", paste(spec, "_mcscan_input", " -b 1", sep = ""), sep = ""))
+#  setwd("..")
+#}
+```
+
+## Quickie visualizations before statistics
+```{r}
+for (spec in specs) {
+  spec = gsub("_refseq", "", spec)
+  collinearity = read.table(paste("../processed_data/", spec, "/", spec, "_mcscan_input.collinearity", sep = ""), comment.char = "#", sep = "\t")
+  
+  #we only want the gene names so get rid of the other data
+  collinearity = collinearity[,2:3]
+  
+  #correct gene name by removing the "dc0|" filler
+  collinearity$V2 = gsub("dc0\\|", "", collinearity$V2)
+  collinearity$V3 = gsub("dc0\\|", "", collinearity$V3)
+  
+  #get list of colinear genes
+  colinear_genes = unique(c(collinearity$V2, collinearity$V3))
+  
+  #read in the duplication data from before
+  df_c = read.csv(paste("../processed_data/duplication_tables/", spec, "_dupnowgd.csv", sep = ""), sep = " ")
+  
+  #if genes are in the colinear gene list, mark them as segmental in the df_c data record that has all the duplication events
+  df_c$segmental = ifelse(df_c$gene %in% colinear_genes, TRUE, FALSE)
+
+  #convert the classifications into numbers so that you can make a max column
+  dup_class = df_c
+
+  dup_class$segmental = ifelse(dup_class$segmental == TRUE, 4, NA)
+  dup_class$tandem = ifelse(dup_class$tandem == TRUE, 3, NA)
+  dup_class$proximal = ifelse(dup_class$proximal == TRUE, 2, NA)
+  dup_class$dispersed = ifelse(dup_class$dispersed == TRUE, 1, NA)
+  dup_class$singleton = ifelse(dup_class$singleton == TRUE, 0, NA)
+
+  dup_class$num_class = pmax(dup_class$singleton, dup_class$dispersed, dup_class$proximal, dup_class$tandem, dup_class$segmental, na.rm = TRUE)
+
+  #what's the distribution of the classes
+  table(dup_class$num_class)
+  table(dup_class$num_class)/sum(table(dup_class$num_class))
+
+  dup_class$myco = ifelse(dup_class$ortho %in% am_ortho, "AM", "NM")
+
+  #get observed percentages of duplication types in the AM orthogroup
+  am_dup = dup_class[dup_class$myco == "AM",]
+
+  am_obs = table(am_dup$num_class)/sum(table(am_dup$num_class))
+
+  #randomly subsample from whole genome with same number of am_ortho   groups in am_dup
+  null_count = 10000
+  rand_obs = data.frame("0" = rep(NA, null_count),
+                        "1" = rep(NA, null_count),
+                        "2" = rep(NA, null_count),
+                        "3" = rep(NA, null_count),
+                        "4" = rep(NA, null_count))
+
+  for (i in 1:null_count) {
+    hold_ortho = unique(dup_class$ortho)
+    rand_ortho = sample(hold_ortho, length(unique(am_dup$ortho)))
+
+    hold_dup = dup_class[dup_class$ortho %in% rand_ortho,]
+    hold_obs = table(hold_dup$num_class)/sum(table(hold_dup$num_class))
+    names(hold_obs) = paste("X", names(hold_obs), sep = "")
+    rand_obs[i,names(hold_obs)] = hold_obs
+  }
+  
+  colnames(rand_obs) = c("singleton", "dispersed", "proximal", "tandem", "segmental")
+
+  #plot random distributions with observed values for better visualization
+  rand_long = gather(rand_obs, dup_class, proportion, singleton:segmental, factor_key = TRUE)
+  
+  #save to disk for stats later
+  write.csv(rand_long, paste("../processed_data/rand_dupevents/", spec, "_rand-dupevents.csv", sep = ""), quote = FALSE, row.names = FALSE)
+  write.csv(dup_class, paste("../processed_data/duplication_frequencies/", spec, "_withwgd.csv", sep = ""), quote = FALSE, row.names = FALSE)
+
+  p = ggplot() +
+      geom_violin(data = rand_long, aes(x = dup_class, y = proportion)) +
+      geom_point(aes(x = 1:5, y = as.vector(am_obs)), size = 3) +
+      ggtitle(spec) +
+      theme_classic()
+  ggsave(paste("../temp_images/", spec, ".pdf"), plot = p, device = "pdf")
+}
+```
+## Duplication origin stats
+```{r}
+#get count of scaffolds per species. Species whose genomes are split over too many scaffolds will not be good for WGD analyses
+#also get observed ratios of duplication origin types from AM orthogroups
+all_am = data.frame("singleton" = rep(NA, length(specs)),
+                    "dispersed" = rep(NA, length(specs)),
+                    "proximal" = rep(NA, length(specs)),
+                    "tandem" = rep(NA, length(specs)),
+                    "segmental" = rep(NA, length(specs)),
+                    "species" = rep(NA, length(specs))
+                    )
+
+scaff_counts = rep(NA, length(specs))
+count = 1
+
+all_rand = data.frame("dup_class" = character(),
+                      "proportion" = numeric(),
+                      "species" = character()
+                      )
+
+for (spec in specs) {
+  spec = gsub("_refseq", "", spec)
+  names(scaff_counts)[count] = spec
+  
+  #read in random observations and append with species names
+  rand_df = read.csv(paste("../processed_data/rand_dupevents/", spec, "_rand-dupevents.csv", sep = ""))
+  rand_df$species = spec
+  all_rand = rbind(all_rand, rand_df)
+  
+  #read in dup_classes to get scaffold counts and am orthogroup proportions of duplication types
+  temp_df = read.csv(paste("../processed_data/duplication_frequencies/", spec, "_withwgd.csv", sep = ""))
+  
+  scaff_counts[count] = length(unique(temp_df$chrom))
+  
+  am_dup = temp_df[temp_df$myco == "AM",]
+  all_am[count,1:5] = table(am_dup$num_class)/sum(table(am_dup$num_class))
+  all_am[count, "species"] = spec
+  
+  count = count + 1
+}
+
+#convert all_am to long form
+am_long = gather(all_am, dup_class, proportion, singleton:segmental, factor_key = TRUE)
+
+#some of the values are NAs when they should be 0. Not converting them to 0 and using na.rm = TRUE in mean calculation downstream means dividing over fewer categories rather than the full 5 so you overestimate the mean.
+all_rand = all_rand %>% 
+  replace_na(list(proportion = 0))
+```
+
+Remove species with too many scaffolds
+```{r}
+#Find cut-off based on histogram of number of scaffolds to find out where outliers really begin
+#I used model species and/or important agricultural crops so the vast majority would have near complete contigs
+hist(scaff_counts, breaks = 30)
+
+#Based on the histogram, 500 scaffolds seems to be a decent cut-off. We can discuss a better cut-off criterion later because even some of the taxa that had more scaffolds had reasonable distributions of duplication types that matched taxa with fewer scaffolds.
+#We lose 8 out of 32 taxa with a cut-off of 500 scaffolds
+scaff_filt = scaff_counts[scaff_counts <= 500]
+
+#filter the observed and random dataframes for these taxa that pass the filter.
+rand_filt = all_rand[all_rand$species %in% names(scaff_filt),]
+am_filt = am_long[am_long$species %in% names(scaff_filt),]
+```
+Calculate uncorrected two-tailed p-values for each species that passed the filter and for each type of duplication event.
+```{r}
+dup_p = data.frame("dup_class" = character(),
+                   "p_value" = numeric(),
+                   "am_observed" = numeric(),
+                   "rand_mean" = numeric(),
+                   "species" = character()
+                   )
+
+count = 1
+
+for (spec in names(scaff_filt)) {
+  obs_spec = am_filt[am_filt$species == spec,] %>%
+    group_by(dup_class)
+  rand_spec = rand_filt[rand_filt$species == spec,] %>%
+    group_by(dup_class)
+  
+  #absolute difference from random mean for all random values
+  rand_bin = rand_spec %>% 
+    summarise(delta_diff = abs(proportion - mean(proportion)))
+  
+  for (i in unique(rand_bin$dup_class)) {
+    am_observed = obs_spec[obs_spec$dup_class == i, ]$proportion
+    rand_mean = mean(rand_spec[rand_spec$dup_class == i, ]$proportion)
+    
+    dup_p[count, "dup_class"] = i
+    dup_p[count, "species"] = spec
+    dup_p[count, "rand_mean"] = rand_mean
+    dup_p[count, "am_observed"] = am_observed
+    
+    
+    dup_p[count, "p_value"] = sum(rand_bin[rand_bin$dup_class == i,]$delta_diff > abs(am_observed - rand_mean))/null_count
+    
+    count = count + 1
+  }
+}
+```
+
+Visualize p-values in heatmap to get overarching vibes
+```{r}
+p2 = ggplot(dup_p, aes(species, -log10(p_value + 1))) +
+  geom_point(aes(fill = am_observed - rand_mean), color = "black", shape = 21, size = 2) +
+  scale_fill_gradient2(midpoint = 0, low = "red", mid = "white", high = "blue") +
+  facet_grid(vars(dup_class)) +
+  theme_test() +
+  geom_hline(yintercept = -log10(.05 + 1), linetype = "dashed") +
+  scale_x_discrete(guide = guide_axis(angle = 90))
+
+ggsave("../temp_images/uncorrected_p-values_duplication_types.pdf",p2, width = 6, height = 10, units = "in")
+```
+
+```{r}
+#prettier plotting
+(p3 = ggplot(dup_p, aes(species, p_value)) +
+  geom_point(aes(fill = am_observed - rand_mean), color = "black", shape = 21, size = 2) +
+  scale_fill_gradient2(midpoint = 0, low = "red", mid = "white", high = "blue") +
+  facet_grid(vars(dup_class)) +
+  theme_test() +
+  geom_hline(yintercept = .05/24, linetype = "dashed") +
+  scale_x_discrete(guide = guide_axis(angle = 90))
+)
+
+dup_p_filt = dup_p[dup_p$dup_class != "singleton",]
+dup_p_filt$dup_class = factor(dup_p_filt$dup_class, levels = c("tandem", "proximal", "segmental", "dispersed"))
+
+(p3 = ggplot(dup_p_filt, aes(p_value, am_observed-rand_mean)) +
+  geom_point(aes(alpha = p_value <= .05/24), color = "#f59761") +
+  scale_alpha_discrete(range = c(.2, 1)) +
+  facet_wrap(vars(dup_class), ncol = 4) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_x_continuous(guide = guide_axis(angle = 90))
+)
+
+ggsave("../temp_images/corrected_p-values_duplication_types.pdf",p3, width = 18.4, height = 6, units = "cm")
+```
+
+```{r}
+#identify significant groupings
+dup_p$significant = dup_p$p_value <= 0.05/length(unique(dup_p$species))
+
+#add significance variable to the all_rand dataframe so that you can highlight which results were significant
+all_rand_comb = merge(all_rand, dup_p, by = c("dup_class", "species"))
+all_rand_comb = all_rand_comb[all_rand_comb$dup_class != "singleton",]
+
+all_rand_comb$dup_class = factor(all_rand_comb$dup_class, levels = c("tandem", "proximal", "segmental", "dispersed"))
+
+species_names = all_rand_comb %>%
+  separate_wider_delim(species, delim = "_", names = c(NA, "genus", "spec"))
+
+species_names = species_names[,c("genus", "spec")]
+species_names$genus = capitalize(species_names$genus)
+all_rand_comb$species_names = paste(species_names$genus, species_names$spec, sep = " ")
+
+am_long = merge(am_long, dup_p, by = c("dup_class", "species"))
+
+#prettier plotting of random distributions
+(p4 = ggplot(all_rand_comb, aes(species, proportion)) +
+  geom_violin(aes(alpha = significant), fill = "#f59761") +
+  geom_point(data = am_long[(am_long$species %in% unique(all_rand_comb$species)) & (am_long$dup_class != "singleton"),], aes(species, proportion, alpha = significant), size = 2) +
+  scale_alpha_discrete(range = c(.2, 1)) +
+  facet_grid(rows = vars(dup_class), scales = "free") +
+  theme_classic() +
+  theme(legend.position = "none") +
+  scale_x_discrete(guide = guide_axis(angle = 90), breaks = unique(all_rand_comb$species), labels = unique(all_rand_comb$species_names)) +
+  theme(axis.text.x = element_text(face = "italic")) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.01)))
+
+ggsave("../temp_images/all_random_distributions_duplication_types.pdf",p4, width = 18.4, height = 20, units = "cm")
+```
+
+
+## Variation analysis
+I want to test if the tandem duplications in AM-specific orthogroups vary in size more than you would expect from random (against all other tandem duplications or against all other types of duplications). The reason why this would matter is because if the AM orthogroup sizes are more variable, this would imply lineage-specific tandem duplications are common meaning, that across the plant kingdom, you consistently have a pressure to maintain these tandem duplicates because the pressure is occurring independently.
+
+```{r}
+#create a dataframe storing all the duplication info across all species
+global_df = data.frame()
+
+for (spec in names(scaff_filt)) {
+  temp_df = read.csv(paste("../processed_data/duplication_frequencies/", spec, "_withwgd.csv", sep = ""))
+  temp_df$species = spec
+  global_df = rbind(global_df, temp_df)
+}
+
+#to compare among tandem duplicates only. only select the tandem duplicates
+global_filt = global_df[global_df$num_class == 3, ]
+
+global_counts = global_filt %>%
+  group_by(species, ortho, myco) %>% #myco status is 1:1 with orthogroup so it doesn't impact the grouping
+  summarise(tandem_count = n())
+
+am_counts = global_counts[global_counts$myco == "AM",]
+
+#calculate coefficient of variation of tandem duplications for each orthogroup between species
+am_cov = am_counts %>%
+  ungroup() %>%
+  group_by(ortho) %>%
+  summarise(ortho_cov = sd(tandem_count)/mean(tandem_count))
+
+global_cov = global_counts %>%
+  ungroup() %>%
+  group_by(ortho) %>%
+  summarise(ortho_cov = sd(tandem_count)/mean(tandem_count))
+
+#removing orthogroups stable in size
+#wilcox.test(am_cov[am_cov$ortho_cov > 0,]$ortho_cov, global_cov[global_cov$ortho_cov > 0,]$ortho_cov)
+
+#not removing orthogroups stable in size
+wilcox.test(am_cov$ortho_cov, global_cov$ortho_cov)
+
+#for plotting
+am_covplot = am_cov
+am_covplot$model_group = "AM"
+
+global_covplot = global_cov
+global_covplot$model_group = "global"
+
+plotter = rbind(am_covplot, global_covplot)
+
+ggplot(plotter, aes(model_group, ortho_cov)) +
+  geom_violin()
+
+ggplot(plotter, aes(model_group, ortho_cov)) +
+  geom_boxplot()
+
+#ggplot(plotter[plotter$ortho_cov > 0,], aes(model_group, ortho_cov)) +
+#  geom_violin()
+
+#ggplot(plotter[plotter$ortho_cov > 0,], aes(model_group, ortho_cov)) +
+#  geom_boxplot()
+
+#how much bigger is COV in AM groups than all orthogroups
+(mean(am_cov$ortho_cov, na.rm = TRUE) - mean(global_cov$ortho_cov, na.rm = TRUE))/mean(global_cov$ortho_cov, na.rm = TRUE)
+
+#absolute difference in cov
+mean(am_cov$ortho_cov, na.rm = TRUE) - mean(global_cov$ortho_cov, na.rm = TRUE)
+
+#repeat by giving orthogroups with a COV of NA a value of 0
+plotter0 = plotter
+plotter0[is.na(plotter0$ortho_cov),"ortho_cov"] = 0
+
+wilcox.test(ortho_cov ~ model_group, plotter0)
+t.test
+
+ggplot(plotter0, aes(model_group, ortho_cov)) +
+  geom_violin()
+
+ggplot(plotter0, aes(model_group, ortho_cov)) +
+  geom_boxplot()
+```
+## Repeat COV analysis across all duplication types
+
+```{r}
+global_filt = global_df
+
+global_counts = global_filt %>%
+  group_by(species, ortho, myco, num_class) %>% #myco status is 1:1 with orthogroup so it doesn't impact the grouping
+  summarise(num_count = n())
+
+am_counts = global_counts[global_counts$myco == "AM",]
+
+#calculate coefficient of variation of duplications for each orthogroup between species
+am_cov = am_counts %>%
+  ungroup() %>%
+  group_by(ortho, num_class) %>%
+  summarise(ortho_cov = sd(num_count)/mean(num_count))
+
+global_cov = global_counts %>%
+  ungroup() %>%
+  group_by(ortho, num_class) %>%
+  summarise(ortho_cov = sd(num_count)/mean(num_count))
+
+#not removing orthogroups stable in size
+tobind = global_df[,c("ortho", "myco")]
+tobind = tobind %>%
+  distinct(ortho, myco)
+global_cov = merge(global_cov, tobind, by = "ortho")
+
+cov_model = lm(ortho_cov ~ myco * num_class, data = global_cov)
+Anova(cov_model, type = "III")
+
+#for plotting
+am_covplot = global_cov[global_cov$myco == "AM",]
+am_covplot$model_group = "AM"
+
+global_covplot = global_cov
+global_covplot$model_group = "global"
+
+plotter = rbind(am_covplot, global_covplot)
+
+ggplot(plotter, aes(model_group, ortho_cov)) +
+  geom_violin() +
+  facet_wrap(vars(num_class))
+
+ggplot(plotter, aes(model_group, ortho_cov)) +
+  geom_boxplot() +
+  facet_wrap(vars(num_class))
+
+#pairwise test of the 4 duplication types (1-4)
+t.test(ortho_cov ~ model_group, data = plotter[plotter$num_class == 1,]) #dispersed
+t.test(ortho_cov ~ model_group, data = plotter[plotter$num_class == 2,]) #proximal
+t.test(ortho_cov ~ model_group, data = plotter[plotter$num_class == 3,]) #tandem
+t.test(ortho_cov ~ model_group, data = plotter[plotter$num_class == 4,]) #wgd/segmental
+```
+
+
+## Repeat without removing species
+Remove species with too many scaffolds
+```{r}
+#Find cut-off based on histogram of number of scaffolds to find out where outliers really begin
+#I used model species and/or important agricultural crops so the vast majority would have near complete contigs
+hist(scaff_counts, breaks = 30)
+
+#Based on the histogram, 500 scaffolds seems to be a decent cut-off. We can discuss a better cut-off criterion later because even some of the taxa that had more scaffolds had reasonable distributions of duplication types that matched taxa with fewer scaffolds.
+#We lose 8 out of 32 taxa with a cut-off of 500 scaffolds
+scaff_filt = scaff_counts#[scaff_counts <= 500]
+
+#filter the observed and random dataframes for these taxa that pass the filter.
+rand_filt = all_rand[all_rand$species %in% names(scaff_filt),]
+am_filt = am_long[am_long$species %in% names(scaff_filt),]
+```
+Calculate uncorrected two-tailed p-values for each species that passed the filter and for each type of duplication event.
+```{r}
+dup_p = data.frame("dup_class" = character(),
+                   "p_value" = numeric(),
+                   "am_observed" = numeric(),
+                   "rand_mean" = numeric(),
+                   "species" = character()
+                   )
+
+count = 1
+
+for (spec in names(scaff_filt)) {
+  obs_spec = am_filt[am_filt$species == spec,] %>%
+    group_by(dup_class)
+  rand_spec = rand_filt[rand_filt$species == spec,] %>%
+    group_by(dup_class)
+  
+  #absolute difference from random mean for all random values
+  rand_bin = rand_spec %>% 
+    summarise(delta_diff = abs(proportion - mean(proportion)))
+  
+  for (i in unique(rand_bin$dup_class)) {
+    am_observed = obs_spec[obs_spec$dup_class == i, ]$proportion
+    rand_mean = mean(rand_spec[rand_spec$dup_class == i, ]$proportion)
+    
+    dup_p[count, "dup_class"] = i
+    dup_p[count, "species"] = spec
+    dup_p[count, "rand_mean"] = rand_mean
+    dup_p[count, "am_observed"] = am_observed
+    
+    
+    dup_p[count, "p_value"] = sum(rand_bin[rand_bin$dup_class == i,]$delta_diff > abs(am_observed - rand_mean))/null_count
+    
+    count = count + 1
+  }
+}
+```
+Visualize p-values in heatmap to get overarching vibes
+```{r}
+p2 = ggplot(dup_p, aes(species, -log10(p_value + 1))) +
+  geom_point(aes(fill = am_observed - rand_mean), color = "black", shape = 21, size = 2) +
+  scale_fill_gradient2(midpoint = 0, low = "red", mid = "white", high = "blue") +
+  facet_grid(vars(dup_class)) +
+  theme_test() +
+  geom_hline(yintercept = -log10(.05 + 1), linetype = "dashed") +
+  scale_x_discrete(guide = guide_axis(angle = 90))
+
+p2
+```
+```{r}
+#create a dataframe storing all the duplication info across all species
+global_df = data.frame()
+
+for (spec in names(scaff_filt)) {
+  temp_df = read.csv(paste("../processed_data/duplication_frequencies/", spec, "_withwgd.csv", sep = ""))
+  temp_df$species = spec
+  global_df = rbind(global_df, temp_df)
+}
+
+#to compare among tandem duplicates only. only select the tandem duplicates
+global_filt = global_df[global_df$num_class == 3, ]
+
+global_counts = global_filt %>%
+  group_by(species, ortho, myco) %>% #myco status is 1:1 with orthogroup so it doesn't impact the grouping
+  summarise(tandem_count = n())
+
+am_counts = global_counts[global_counts$myco == "AM",]
+
+#calculate coefficient of variation of tandem duplications for each orthogroup between species
+am_cov = am_counts %>%
+  ungroup() %>%
+  group_by(ortho) %>%
+  summarise(ortho_cov = sd(tandem_count)/mean(tandem_count))
+
+global_cov = global_counts %>%
+  ungroup() %>%
+  group_by(ortho) %>%
+  summarise(ortho_cov = sd(tandem_count)/mean(tandem_count))
+
+#removing orthogroups stable in size
+#wilcox.test(am_cov[am_cov$ortho_cov > 0,]$ortho_cov, global_cov[global_cov$ortho_cov > 0,]$ortho_cov)
+
+#not removing orthogroups stable in size
+wilcox.test(am_cov$ortho_cov, global_cov$ortho_cov)
+
+#for plotting
+am_covplot = am_cov
+am_covplot$model_group = "AM"
+
+global_covplot = global_cov
+global_covplot$model_group = "global"
+
+plotter = rbind(am_covplot, global_covplot)
+
+ggplot(plotter, aes(model_group, ortho_cov)) +
+  geom_violin()
+
+ggplot(plotter, aes(model_group, ortho_cov)) +
+  geom_boxplot()
+
+#ggplot(plotter[plotter$ortho_cov > 0,], aes(model_group, ortho_cov)) +
+#  geom_violin()
+
+#ggplot(plotter[plotter$ortho_cov > 0,], aes(model_group, ortho_cov)) +
+#  geom_boxplot()
+
+#how much bigger is COV in AM groups than all orthogroups
+(mean(am_cov$ortho_cov, na.rm = TRUE) - mean(global_cov$ortho_cov, na.rm = TRUE))/mean(global_cov$ortho_cov, na.rm = TRUE)
+
+#absolute difference in cov
+mean(am_cov$ortho_cov, na.rm = TRUE) - mean(global_cov$ortho_cov, na.rm = TRUE)
+```

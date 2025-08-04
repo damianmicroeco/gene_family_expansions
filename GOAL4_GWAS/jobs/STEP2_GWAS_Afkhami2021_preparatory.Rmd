@@ -1,0 +1,73 @@
+---
+title: "GWAS - Afkhami et al 2021"
+output: html_document
+date: '2022-04-07'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preface
+
+The goal of this script is to prepare files to conduct a GWAS using performance data from Afkhami et al 2021 (https://doi.org/10.1111/ele.13814). We will use this data to determine if larger gene families have more genetic variation between M. truncatula genotypes associated with mycorrhizal benefit between genotypes. The reason why we have to prepare the data beforehand is because we need to use the bcftools functions from the conda environment in our Windows Subsystem for Linux which cannot be run on Windows (which is the OS this script and the actual GWAS is being run on).
+
+The assumed working directory is the jobs folder.
+
+```{r}
+library(dplyr)
+```
+
+## Dataframe Management
+
+```{r}
+#load in performance data from Afkhami et al 2021
+perf_data = read.csv("../metadata/Afkhami2021_data_by_genotype_dryad.csv")
+
+#remove the data from samples with rhizobial inoculations (not of interest at the moment)
+perf_data = perf_data[perf_data$rhizo == "NR",]
+
+#filter for only columns you will use
+perf_data = perf_data[,c("myco", "line", "mean_pod", "mean_branch", "mean_root2shoot")]
+
+#per my conversation with Michelle, plants that had zero pods and an NA in mean_branch died in the experiment. We can use this double boolean as a proxy for survival.
+perf_data$survival = (perf_data$mean_pod > 0) & !is.na(perf_data$mean_branch)
+perf_data$survival = perf_data$survival*1
+
+#create a new dataframe that makes comparisons between NM and M within genotypes
+rel_perf = perf_data %>%
+  group_by(line) %>%
+  mutate("d_pod" = mean_pod[myco == "M"] - mean_pod,
+         "d_survival" = survival[myco == "M"] - survival,
+         "d_root2shoot" = mean_root2shoot[myco == "M"] - mean_root2shoot
+         )
+
+#select for only the relevant columns and just the NM values because the d columns will tell you how much the plant benefited relative to the Mycorrhizal condition.
+rel_perf = as.data.frame(rel_perf)
+rel_perf = rel_perf[rel_perf$myco == "NM", c("line", "d_pod", "d_survival", "d_root2shoot")]
+
+#NOTE: survival was barely effected (167 no impact, 21 cost, 25 benefited)
+#So, I think it makes sense to only analyze the fitness proxy (pod number) and the investment proxy (root2shoot) separately.
+#Because survival is also part of fitness, I will not filter based on survival. I will remove NAs from investment because I cannot compare how something invested if it died or there is no data.
+pod_df = perf_data[,c("myco", "line", "mean_pod")]
+inv_df = perf_data[,c("myco", "line", "mean_root2shoot")]
+
+rel_pod = pod_df %>%
+  group_by(line) %>%
+  mutate("d_pod" = mean_pod[myco == "M"] - mean_pod)
+
+rel_inv = inv_df %>%
+  group_by(line) %>%
+  mutate("d_root2shoot" = mean_root2shoot[myco == "M"] - mean_root2shoot)
+
+#only keep relevant columns and, for rel_inv, remove NAs
+rel_pod = rel_pod[rel_pod$myco == "NM", c("line", "d_pod")]
+
+rel_inv = rel_inv[rel_inv$myco == "NM", c("line", "d_root2shoot")]
+rel_inv = rel_inv[!is.na(rel_inv$d_root2shoot),]
+
+#write these dataframes to disk
+write.csv(rel_pod, "../metadata/afkhami2021_pod_gwas.csv", row.names = FALSE)
+write.csv(rel_inv, "../metadata/afkhami2021_investment_gwas.csv", row.names = FALSE)
+```
+

@@ -1,0 +1,136 @@
+---
+title: "GWAS Pods"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preface
+
+The goal of this experiment is to perform a GWAS using pod counts from Afkhami et al 2021 from which I calculated the increase of pods in Mycorrhizal associating genotypes.
+
+The SNP data was prefiltered for SNPs that have minor allele frequencies greater than 0.05 and genotypes for which there was pod data. Some of the genotypes do not have SNP data and will have to be removed from the pod dataframe for the GWAS.
+
+The working directory is the jobs folder.
+
+This script is heavily based off of the one made for the GEA analysis with inputs adjusted for this dataset.
+
+```{r}
+library(LEA)
+```
+
+## Directory Management
+
+LEA doesn't load entire files into memory. Instead it exports files needed to work in the LEA package within a directory. As a result, we need to build a directory to store those outputs and preferably work in there.
+
+```{r}
+#This has been already been run, so I'm commenting it out.
+dir.create("../processed_data/20220407_GWAS_pod_output")
+```
+
+## Identify population structure
+
+To perform a GEA using the Latent Factor Mixed Model we need to identify how many populations could be in the data. We will use both PCA and snmf() to get an idea of how many populations are present in the dataset.
+
+```{r}
+setwd("../processed_data/20220407_GWAS_pod_output")
+
+file_prefix = "pod_filteredset2014_cleaned"
+
+#convert vcf file to lfmm
+vcf2lfmm(paste("../", file_prefix, ".vcf", sep = ""), output.file = file_prefix)
+
+#for some reason vcf2lfmm() won't create the files in the working directory and chooses the input files path as the output
+#I think it takes the whole filename including the absolute path and just adds the file extensions. this line moves the files to the LEA output directory
+fileext = c(".geno", ".lfmm", ".removed", ".vcfsnp")
+for (i in fileext) {
+  file.rename(paste("../", file_prefix, i, sep = ""), paste(file_prefix, i, sep = ""))
+}
+```
+
+```{r}
+setwd("../processed_data/20220407_GWAS_pod_output")
+
+#Run PCA
+pc = pca(paste(file_prefix, ".lfmm", sep = ""), scale = TRUE)
+
+#Elbow plot of PCA
+plot(pc)
+```
+By elbow in PC plot, it looks like 7-8 populations. Confirming with snmf, but it looks like this is the correct number of populations
+
+```{r results='hide'}
+setwd("../processed_data/20220407_GWAS_pod_output")
+
+project = NULL
+project = snmf(paste(file_prefix, ".geno", sep = ""), K = 1:10, entropy = TRUE, repetitions = 10, project = "new")
+plot(project)
+```
+SNMF agrees with PCA with ~7 being the plateau for the cross-entropy. Below we will plot barcharts of K 6:8 to visually see which ancestral population number looks best.
+
+```{r}
+my_colors = c("tomato", "olivedrab", "gold", "blueviolet", "hotpink", "lightsalmon", "seagreen4", "gray")
+for (i in 6:8) {
+  best = which.min(cross.entropy(project, K = i))
+  barchart(project, K = i, run = best, xlab = "Individuals", ylab = "Ancestry Proportions", main = paste("Ancestry matrix, K = ", i, sep = ""), col = my_colors, border = NA, space = 0)
+}
+```
+
+7 ancestral populations looks the cleanest which is roughly in agreement with the PCA and SNMF analyses.
+
+## Imputing missing SNP data
+
+LFMM requires data to be complete (so does the RDA which will be used as a way to confirm the LFMM). As a result, even though we removed SNPs missing in more than 10% of genotypes, we need to fill in the missing subset. We can use impute() in the LEA package and use the most common variant as what is included. Another option is to put in a random variant, but "mode" seems to be the way to go in the LEA vignette and online tutorials. Alternatives to impute() could also be used and we should discuss later if necessary.
+```{r}
+setwd("../processed_data/20220407_GWAS_pod_output")
+
+impute(project, paste(file_prefix, ".lfmm", sep = ""),
+method = "mode", K = 7, run = best)
+```
+
+## Perform LFMMs
+
+```{r}
+#read in pod data and remove the genotypes that had pod data but were not sequenced. Genotypes were ordered alphabetically in vcf file like in metadata
+setwd("../processed_data/20220407_GWAS_pod_output")
+
+#genotypes not in SNP data according to bcftools filtering output
+missing = c("HM251")
+
+metadata = read.csv("../../metadata/afkhami2021_pod_gwas.csv")
+
+metadata = metadata[! metadata$line %in% missing,]
+```
+
+```{r}
+#The variables are labeled as {environmental dimension}{K number}
+#Each test with different Ks for each environmental dimension is saved to it's own variable
+#I will run for K between 6 and 8 since those were pretty good Ks in the PCA and SNMF analyses
+setwd("../processed_data/20220407_GWAS_pod_output")
+
+hap_lfmm_impute = read.lfmm(paste(file_prefix, ".lfmm_imputed.lfmm", sep = ""))
+
+#lfmms including all variables. the second column is pod data
+all6 = lfmm2(hap_lfmm_impute, metadata[,2], 6)
+all7 = lfmm2(hap_lfmm_impute, metadata[,2], 7)
+all8 = lfmm2(hap_lfmm_impute, metadata[,2], 8)
+```
+The most time intensive step is reading in the data fame from disk. Luckily, lfmm2 lets you use a matrix after reading in the lfmm unlike the pca and snmf functions in the LEA package.
+
+## testing chunk
+```{r}
+test_all6 = lfmm2.test(all6, hap_lfmm_impute, metadata[,2], linear = TRUE, genomic.control = TRUE)
+test_all7 = lfmm2.test(all7, hap_lfmm_impute, metadata[,2], linear = TRUE, genomic.control = TRUE)
+test_all8 = lfmm2.test(all8, hap_lfmm_impute, metadata[,2], linear = TRUE, genomic.control = TRUE)
+```
+
+```{r}
+setwd("../processed_data/20220407_GWAS_pod_output")
+save.image(file = "20220407_GWAS_pod.RData")
+```
+
+
+
+

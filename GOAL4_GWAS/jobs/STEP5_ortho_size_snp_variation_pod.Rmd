@@ -1,0 +1,449 @@
+---
+title: "Orthogroup Size and SNP Variation"
+output: html_document
+date: '2022-03-24'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preface
+
+The goal of this analysis is to determine if larger orthogroups have more natural variation than smaller groups.
+This inputs are the results of the GWAS associating SNP variation with change in pod counts in response to mycorrhizal inoculation. We will repeat the analyses for all the GEAs with different numbers of ancestral populations.
+
+The assumed working directory is the jobs folder.
+
+```{r}
+library(reshape)
+library(dplyr)
+library(splitstackshape)
+library(ggplot2)
+```
+
+## Dataframe management
+
+```{r}
+#load in GEA results with SNP mappings to genes
+gea6p = read.csv("../processed_data/20220407_GWAS_pod_output/20220408_GWASResults_pod_Mapped_SNPS_6pops.csv")
+gea7p = read.csv("../processed_data/20220407_GWAS_pod_output/20220408_GWASResults_pod_Mapped_SNPS_7pops.csv")
+gea8p = read.csv("../processed_data/20220407_GWAS_pod_output/20220408_GWASResults_pod_Mapped_SNPS_8pops.csv")
+
+#split the gen id to get the jcvi id
+gea6p = cbind(gea6p, colsplit(gea6p$gen_id, split = "_", names = c("jcvi", "gen_start")))
+gea7p = cbind(gea8p, colsplit(gea7p$gen_id, split = "_", names = c("jcvi", "gen_start")))
+gea8p = cbind(gea8p, colsplit(gea8p$gen_id, split = "_", names = c("jcvi", "gen_start")))
+
+
+#load in map of JCVI gene IDs to RefSeq
+jcvi = read.csv("../metadata/Medicago_truncatula.MedtrA17_4.0.52.refseq.tsv", sep = "\t")
+ortho = read.csv("../metadata/orthogroup_identified_AM_medicago_truncatula_genome_metadata.tsv", sep = "\t")
+blast_res = read.csv("../metadata/20210706_medicago_blast_with_orthogroup.tsv", sep = "\t")
+blast_res$X = NULL
+
+#fix jcvi id prefix to match that in HapMap
+jcvi$gene_stable_id = gsub("MTR_", "Medtr", jcvi$gene_stable_id)
+jcvi = jcvi[grepl("Medtr", jcvi$gene_stable_id),]
+
+#merge jcvi ids to ortho-identified refseq IDs
+ortho = merge(jcvi, ortho, by.x = "xref", by.y = "Protein.product", all.x = TRUE)
+blast_res = merge(jcvi, blast_res, by.x = "gene_stable_id", by.y = "jcvi", all.x = TRUE)
+
+#filter dataframe to only have genes with refseq protein products
+ortho = ortho[grepl("XP_", ortho$xref),]
+blast_res = blast_res[grepl("XP_", blast_res$xref),]
+
+#there are a lot of genes that don't match to RefSeq IDs in the original ortho dataframe.
+#I checked 12 of them and they were all removed as part of standard genome annotation.
+#I will use the results from the BLAST matching which retained most of the annotated genes in the JCVI annotation and genes that did not have a BLAST match to something in an orthogroup was just lumped into "not_in_refseq"
+#some genes still do not a match to a RefSeq in the BLAST (~5%). They were mostly genes removed during the genome annotation process. I will remove them from the dataframe here and reclassify them when mapping to GEA results as "not_in_refseq".
+blast_res = blast_res[complete.cases(blast_res),]
+
+#use a reduced dataframe that only keeps the jcvi IDs (for matching to GEA results) and the orthogroup identity
+#there will be some duplicates because, in the original jcvi dataframe, different isoforms were provided or each gene.
+#because we matched by gene id, all the different isoforms will have the same orthogroup identity which is based on the longest isoform
+blast_res = blast_res[,c("gene_stable_id","orthogroup")]
+
+blast_res = blast_res %>%
+  distinct(.keep_all = TRUE)
+```
+
+## Mapping SNPs to Orthogroups
+
+```{r}
+#for the first set of analyses, we are excluding intergenic SNPs and not expanding the range of the genome annotations
+gea6p = gea6p[!is.na(gea6p$jcvi),]
+gea7p = gea7p[!is.na(gea7p$jcvi),]
+gea8p = gea8p[!is.na(gea8p$jcvi),]
+
+#add orthogroup identities
+gea6p = merge(gea6p, blast_res, by.x = "jcvi", by.y = "gene_stable_id", all.x = TRUE)
+gea7p = merge(gea7p, blast_res, by.x = "jcvi", by.y = "gene_stable_id", all.x = TRUE)
+gea8p = merge(gea8p, blast_res, by.x = "jcvi", by.y = "gene_stable_id", all.x = TRUE)
+
+#place NAs in orthogroup column in broader "not_in_refseq"
+gea6p[is.na(gea6p$orthogroup),"orthogroup"] = "not_in_refseq"
+gea7p[is.na(gea7p$orthogroup),"orthogroup"] = "not_in_refseq"
+gea8p[is.na(gea8p$orthogroup),"orthogroup"] = "not_in_refseq"
+```
+
+## Quantifying SNP variation per gene
+
+```{r}
+#to make things easier for me to read, let's remove unnecessary columns
+gea6p = gea6p[,c("jcvi", "d_pod", "orthogroup")]
+gea7p = gea7p[,c("jcvi", "d_pod", "orthogroup")]
+gea8p = gea8p[,c("jcvi", "d_pod", "orthogroup")]
+
+
+#convert FDR corrected p-values to binary
+gea6p[,2] = (gea6p[,2] < 0.05)*1
+gea7p[,2] = (gea7p[,2] < 0.05)*1
+gea8p[,2] = (gea8p[,2] < 0.05)*1
+
+#calculate number of significant SNPs for each gene
+sig_snp = function(df) {
+  df = df %>%
+    group_by(orthogroup, jcvi) %>%
+    summarise_all(list(sum))
+  return(df)
+}
+gea6p = as.data.frame(sig_snp(gea6p))
+gea7p = as.data.frame(sig_snp(gea7p))
+gea8p = as.data.frame(sig_snp(gea8p))
+
+#get gene lengths to normalize snp variation
+gene_meta = read.csv("../metadata/mt4-0_jcvi/data/GCA_000219495.2/genomic.gtf", sep = "\t", header = FALSE, skip = 4)
+
+#drop last row of gene_meta which is formatting from gtf file
+gene_meta = gene_meta[1:(length(row.names(gene_meta))-1),]
+
+#only select "gene" entries. the "exon" entries are subsections of the gene and anything that is not a gene was not used in the analysis.
+gene_meta = gene_meta[gene_meta$V3 == "gene",]
+
+#split description column by ; delimiter
+gene_meta = cSplit(indt = gene_meta, splitCols = "V9", sep = ";")
+
+#subset gene_meta to only relevant columns
+gene_meta = gene_meta[,c(4,5,14)]
+colnames(gene_meta) = c("jcvi_start", "jcvi_stop", "jcvi")
+gene_meta$jcvi = gsub("note ", "", gene_meta$jcvi)
+gene_meta$jcvi_len = abs(gene_meta$jcvi_stop - gene_meta$jcvi_start)
+
+#for duplicate gene ids, only select the longest annotation
+gene_meta = gene_meta %>%
+  group_by(jcvi) %>%
+  summarise(jcvi_len = max(jcvi_len))
+
+#add gene lengths to SNP dataframes
+gea6p = merge(gea6p, gene_meta, by = "jcvi", all.x = TRUE)
+gea7p = merge(gea7p, gene_meta, by = "jcvi", all.x = TRUE)
+gea8p = merge(gea8p, gene_meta, by = "jcvi", all.x = TRUE)
+
+#normalize snp variation by gene length
+norm6p = gea6p
+norm7p = gea7p
+norm8p = gea8p
+
+norm6p[,3] = norm6p[,3]/norm6p$jcvi_len
+norm7p[,3] = norm7p[,3]/norm7p$jcvi_len
+norm8p[,3] = norm8p[,3]/norm8p$jcvi_len
+```
+
+## Quantifying between orthogroup size in AM-specific orthogroups
+```{r warning = FALSE}
+#load orthogroup identity
+am_ortho = read.csv("../metadata/orthogroup_mannwhitney.csv")
+ortho_ident = (am_ortho$mann_FDR <= 0.05) & (am_ortho$am_v_nm > 1)
+ortho_ident[ortho_ident == TRUE] = "AM"
+ortho_ident[ortho_ident == "FALSE"] = "NM"
+am_ortho$am_ident = ortho_ident
+
+am_ortho = am_ortho[,c("X", "am_ident")]
+colnames(am_ortho)[1] = "orthogroup"
+
+#add orthogroup identities to normalized dataframes
+norm6p = merge(norm6p, am_ortho, by = "orthogroup", all.x = TRUE)
+norm7p = merge(norm7p, am_ortho, by = "orthogroup", all.x = TRUE)
+norm8p = merge(norm8p, am_ortho, by = "orthogroup", all.x = TRUE)
+
+#summarise counts based on jcvi annotations for the orthogroups
+#orthogroup identities are consistent across the normalized dataframes
+ortho_count = norm6p %>%
+  group_by(orthogroup) %>%
+  summarise(gene_count = n())
+
+norm6p = merge(norm6p, ortho_count, by = "orthogroup", all.x = TRUE)
+norm7p = merge(norm7p, ortho_count, by = "orthogroup", all.x = TRUE)
+norm8p = merge(norm8p, ortho_count, by = "orthogroup", all.x = TRUE)
+
+#for this set of analyses remove genes that were not matched to RefSeq genes
+ref6p = norm6p[norm6p$orthogroup != "not_in_refseq",]
+ref7p = norm7p[norm7p$orthogroup != "not_in_refseq",]
+ref8p = norm8p[norm8p$orthogroup != "not_in_refseq",]
+
+#get list of am-specific orthogroups
+am_spec = am_ortho$orthogroup[am_ortho$am_ident == "AM"]
+am_spec = am_spec[am_spec %in% unique(ref6p$orthogroup)]
+
+#calculate observed correlations of am-specific orthogroup size and amount of variation
+obs6p = rep(0,1)
+obs7p = rep(0,1)
+obs8p = rep(0,1)
+env_names = colnames(norm6p)[3]
+obs_df = data.frame(row.names = env_names,
+                    obs6p = obs6p,
+                    obs7p = obs7p,
+                    obs8p = obs8p)
+
+obs_corr = function(obs_out, ref_in, out_col) {
+  for(i in row.names(obs_out)) {
+    snp_var = ref_in[ref_in$am_ident == "AM", i]
+    ortho_size = ref_in[ref_in$am_ident == "AM","gene_count"]
+    test = cor.test(as.vector(snp_var), as.vector(ortho_size), method = "spearman")
+    obs_out[i, out_col] = test$estimate[[1]]
+  }
+  return(obs_out)
+}
+
+obs_df = obs_corr(obs_df, ref6p, "obs6p")
+obs_df = obs_corr(obs_df, ref7p, "obs7p")
+obs_df = obs_corr(obs_df, ref8p, "obs8p")
+
+#calculate randomized relationship between orthogroup size and snp variation with random subsampling of orthogroups
+env_fact = rep(row.names(obs_df), each = 10000)
+env_fact = c(env_fact, env_fact, env_fact)
+gea = rep(c("gea6p", "gea7p", "gea8p"), each = 10000*length(row.names(obs_df)))
+
+samp_df = data.frame(perm_count = rep(1:10000, times = length(row.names(obs_df))*3),
+                     rand_rho = rep(0, length(row.names(obs_df))*3*10000), #creates an empty column to fill with 10000 permutations by the number of factors by the number of GEAs with different ancestral populations
+                     env_fact = env_fact,
+                     gea = gea
+                     )
+
+samp_corr = function(refin_1, refin_2, refin_3, df_out){
+  #samp_ortho variables will randomly select from all orthogroups the same number of orthogroups that are am-specific
+  for (i in 1:length(row.names(df_out))){
+    samp_ortho = sample(unique(refin_1$orthogroup), length(am_spec))
+    if (df_out$gea[i] == "gea6p"){
+      snp_var = refin_1[refin_1$orthogroup %in% samp_ortho, df_out$env_fact[i]]
+      ortho_size = refin_1[refin_1$orthogroup %in% samp_ortho, "gene_count"]
+      test = cor.test(as.vector(snp_var), as.vector(ortho_size), method = "spearman")
+      df_out[i, "rand_rho"] = test$estimate[[1]]
+    }
+    else if (df_out$gea[i] == "gea7p"){
+      snp_var = refin_2[refin_2$orthogroup %in% samp_ortho, df_out$env_fact[i]]
+      ortho_size = refin_2[refin_2$orthogroup %in% samp_ortho, "gene_count"]
+      test = cor.test(as.vector(snp_var), as.vector(ortho_size), method = "spearman")
+      df_out[i, "rand_rho"] = test$estimate[[1]]
+    }
+    else if (df_out$gea[i] == "gea8p"){
+      snp_var = refin_3[refin_3$orthogroup %in% samp_ortho, df_out$env_fact[i]]
+      ortho_size = refin_3[refin_3$orthogroup %in% samp_ortho, "gene_count"]
+      test = cor.test(as.vector(snp_var), as.vector(ortho_size), method = "spearman")
+      df_out[i, "rand_rho"] = test$estimate[[1]]
+    }
+    else {
+      print("Something went wrong.")
+    }
+  }
+  return(df_out)
+}
+
+samp_df = samp_corr(ref6p, ref7p, ref8p, samp_df)
+```
+
+## Calculating p-values
+
+```{r}
+#fill in column for observed values
+samp_df$obs_rho = 0
+
+for (i in row.names(obs_df)){
+  samp_df[(samp_df$env_fact == i) & (samp_df$gea == "gea6p"),"obs_rho"] = obs_df[i,"obs6p"]
+  samp_df[(samp_df$env_fact == i) & (samp_df$gea == "gea7p"),"obs_rho"] = obs_df[i,"obs7p"]
+  samp_df[(samp_df$env_fact == i) & (samp_df$gea == "gea8p"),"obs_rho"] = obs_df[i,"obs8p"]
+}
+
+#create boolean column asking if random is greater than or equal to observed
+samp_df$great_rand = (samp_df$rand_rho >= samp_df$obs_rho)*1
+
+#summarise by sum of number of random rhos greater than observed
+samp_summary = samp_df %>%
+  group_by(gea, env_fact) %>%
+  summarise(great_rand = list(sum(great_rand)))
+
+samp_summary$great_rand = as.numeric(samp_summary$great_rand)
+samp_summary$p_value = samp_summary$great_rand/10000
+
+#split into the different geas for fdr correction (maybe?)
+summary6p = samp_summary[samp_summary$gea == "gea6p",]
+summary7p = samp_summary[samp_summary$gea == "gea7p",]
+summary8p = samp_summary[samp_summary$gea == "gea8p",]
+
+summary6p$fdr = p.adjust(summary6p$p_value, method = "fdr")
+summary7p$fdr = p.adjust(summary7p$p_value, method = "fdr")
+summary8p$fdr = p.adjust(summary8p$p_value, method = "fdr")
+```
+
+## Plotting
+```{r}
+samp_summary = rbind(summary6p, summary7p, summary8p)
+
+#order factors for plotting. Group soil characteristics together for interpretation
+samp_summary$gea = factor(samp_summary$gea, levels = c("gea6p", "gea7p", "gea8p"))
+samp_summary$env_fact = factor(samp_summary$env_fact, levels = c("d_pod"))
+
+samp_df$gea = factor(samp_df$gea, levels = c("gea6p", "gea7p", "gea8p"))
+samp_df$env_fact = factor(samp_df$env_fact, levels = c("d_pod"))
+
+#summarise by sum of number of random rhos greater than observed
+obs_long = samp_df %>%
+  group_by(gea, env_fact) %>%
+  summarise(obs_rho = list(mean(obs_rho)))
+obs_long$obs_rho = as.numeric(obs_long$obs_rho)
+
+samp_summary$fdr_plot = paste("FDR: ", as.character(round(samp_summary$fdr, 4)), sep = "")
+
+ggplot(data = samp_df) +
+  facet_grid(rows = vars(env_fact), cols = vars(gea)) +
+  geom_histogram(aes(rand_rho), fill = "#c3af97") +
+  geom_vline(data = obs_long, aes(xintercept = obs_rho), linetype = "dashed", size = 1) +
+  geom_text(data = samp_summary, aes(-.05, 1000, label = fdr_plot), size = 3) +
+  theme_classic()
+```
+
+```{r}
+save.image("20220324_ortho_size_snp_variation_pod.RData")
+```
+
+
+## Potential Paper Figure Plotting
+We will plot using the data with 7 ancestral populations because that was the one that seemed to be at the elbow of the PCAs screeplot, near the bottom of the cross-entropy plot, and the best groupings from the snmf ancestry matrix plot.
+```{r}
+plot7 = samp_df[samp_df$gea == "gea7p",]
+
+#get upper cut-off for 95% of randomized data to plot where the significance threshold is in the violing plot
+quant_df = plot7 %>%
+  group_by(env_fact) %>%
+  summarise(quant95 = quantile(rand_rho, c(.95)))
+
+#reorder summary7p to match the order in the plot
+summary7 = samp_summary[samp_summary$gea == "gea7p",]
+summary7 = summary7[match(quant_df$env_fact, summary7$env_fact),]
+summary7$p_plot = paste("p = ", as.character(round(summary7$p_value, 4)), sep = "")
+
+# ggplot(plot7, aes(x = env_fact, y = rand_rho)) +
+#   geom_violin(aes(alpha = env_fact), fill = "#f79862") +
+#   scale_alpha_manual(values = c(1, 1, 1, .5, .5)) +
+#   geom_point(data = obs_long[obs_long$gea == "gea7p",], aes(x = env_fact, y = obs_rho), size = 4, alpha = c(1, 1, 1, .5, .5)) +
+#   geom_segment(data = quant_df, aes(x = seq(0.5, 4.5, by = 1), xend = seq(1.5, 5.5, by = 1), y = as.vector(quant_df$quant95), yend = as.vector(quant_df$quant95)), color = "black") +
+#   labs(x = "Environmental Factor", y = "Randomized Spearman's \u03C1") +
+#   scale_x_discrete(labels = c("Labile P", "Soil N", "Soil pH", "Highest Precipitation", "Temperature Range")) +
+#   annotate("text", x = 1:5, y = .27, label = summary7$p_plot) +
+#   theme_classic() +
+#   theme(legend.position = "none") 
+
+ggplot(plot7, aes(x = env_fact, y = rand_rho)) +
+  geom_violin(fill = "#f79862") +
+  geom_point(data = obs_long[obs_long$gea == "gea7p",], aes(x = env_fact, y = obs_rho), size = 4) +
+  geom_segment(data = quant_df, aes(x = c(0.5), xend = c(1.5), y = as.vector(quant_df$quant95), yend = as.vector(quant_df$quant95)), color = "black") +
+  labs(x = "Environmental Factor", y = "Randomized Spearman's \u03C1") +
+  scale_x_discrete(labels = c("Impact on Pod Counts")) +
+  annotate("text", x = 1, y = .27, label = summary7$p_plot) +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+
+## Could AM orthogroups be unique in size?
+```{r}
+size_df = data.frame(perm_count = rep(1:10000),
+                     rand_size = rep(0, 10000)
+                     )
+
+ortho_size_df = ref7p %>%
+  group_by(orthogroup) %>%
+  summarise(avg_size = mean(gene_count))
+    
+for (i in 1:10000) {
+  size_df[i,"rand_size"] = mean(sample(ortho_size_df$avg_size, length(am_spec)))
+}
+
+hist(size_df$rand_size)
+abline(v = mean(ortho_size_df[ortho_size_df$orthogroup %in% am_spec,]$avg_size))
+
+sum(size_df$rand_size > mean(ortho_size_df[ortho_size_df$orthogroup %in% am_spec,]$avg_size))/10000
+```
+
+
+## Repeat SNP variation relationships by relating SNP variation ACROSS the whole orthogroup
+
+```{r warning = FALSE}
+ortho7 = gea7p[gea7p$orthogroup != "not_in_refseq", 2:length(colnames(gea7p))]
+
+ortho7 = group_by(ortho7, orthogroup) %>%
+  summarise_all(sum)
+
+ortho7[,2] = ortho7[,2]/ortho7$jcvi_len
+
+ortho_corr = rep(0,1)
+names(ortho_corr) = colnames(ortho7[,2])
+
+ortho7 = merge(ortho7, ortho_count, by = "orthogroup", all.x = TRUE)
+
+for (i in colnames(ortho7)[2]) {
+  holder = ortho7[ortho7$orthogroup %in% am_spec,]
+  holder_test = cor.test(as.vector(holder[,i]), holder$gene_count, method = "spearman")
+  ortho_corr[i] = holder_test$estimate
+}
+
+#subsampling analysis
+env_fact = rep("d_pod", each = 10000)
+
+samp_df_ortho = data.frame(perm_count = rep(1:10000, times = 1),
+                     rand_rho = rep(0, 10000), #creates an empty column to fill with 10000 permutations by the number of factors by the number of GEAs with different ancestral populations
+                     env_fact = env_fact
+                     )
+
+for (i in 1:length(row.names(samp_df_ortho))) {
+  ortho_samp = sample(ortho7$orthogroup, length(am_spec))
+  holder = ortho7[ortho7$orthogroup %in% ortho_samp,]
+  holder_test = cor.test(as.vector(holder[,samp_df_ortho[i,"env_fact"]]), holder$gene_count, method = "spearman")
+  samp_df_ortho[i,"rand_rho"] = holder_test$estimate
+}
+
+#plotting
+ortho_corr = as.data.frame(ortho_corr)
+ortho_corr$env_fact = row.names(ortho_corr)
+
+ortho_quant_df =  samp_df_ortho %>%
+  group_by(env_fact) %>%
+  summarise(quant95 = quantile(rand_rho, c(.95)))
+
+samp_df_ortho$env_fact = factor(samp_df_ortho$env_fact, levels = c("d_pod"))
+ortho_corr$env_fact = factor(ortho_corr$env_fact, levels = c("d_pod"))
+ortho_quant_df$env_fact = factor(ortho_quant_df$env_fact, levels = c("d_pod"))
+
+#reorder ortho_corr and ortho_quant_df to match the order for plotting
+ortho_corr = ortho_corr[order(ortho_corr$env_fact),]
+ortho_quant_df = ortho_quant_df[order(ortho_quant_df$env_fact),]
+
+ortho_p = merge(samp_df_ortho, ortho_corr, by = "env_fact")
+ortho_p$ortho_bool = (ortho_p$rand_rho >= ortho_p$ortho_corr) * 1
+ortho_p = group_by(ortho_p, env_fact) %>%
+  summarise(p_value = sum(ortho_bool)/10000)
+ortho_p$p_plot = paste("p = ", as.character(round(ortho_p$p_value, 4)), sep = "")
+  
+ggplot(samp_df_ortho, aes(x = env_fact, y = rand_rho)) +
+  geom_violin(fill = "#f79862") +
+  geom_point(data = ortho_corr, aes(x = env_fact, y = ortho_corr), size = 4) +
+  geom_segment(data = ortho_quant_df, aes(x = c(0.5), xend = c(1.5), y = quant95, yend = quant95), color = "black") +
+  labs(x = "Environmental Factor", y = "Randomized Spearman's \u03C1") +
+  scale_x_discrete(labels = c("Impact on Pod Counts")) +
+  annotate("text", x = 1, y = .45, label = ortho_p$p_plot) +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+
+

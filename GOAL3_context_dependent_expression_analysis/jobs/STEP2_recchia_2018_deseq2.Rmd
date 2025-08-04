@@ -1,0 +1,187 @@
+---
+title: "Recchia 2018 Differential Expression"
+author: "Damian Hernandez"
+date: "8/16/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preface
+The goal of this script is to determine if larger AM-specific orthogroups have higher frequencies of context dependent expression than smaller AM-specific orthogroups. This data is that from Recchia 2018 which analyzes roots from Phaseoulus vulgaris in the presence of drought stress +/- the arbuscular mycorrhizal fungus Rhizophagus irregularis.
+
+The assumed working directory is the jobs folder.
+
+```{r}
+library(DESeq2)
+library(dplyr)
+library(reshape2)
+```
+
+## Dataframe management
+
+```{r}
+#merge the counts from the different dataframes
+file_names = list.files("../processed_data/recchia2018_pvulgaris_bam/", pattern = "*.tab")
+
+df = data.frame(gene_id = character(),
+                unstranded = numeric(),
+                forward = numeric(),
+                reverse = numeric(),
+                sample_names = character())
+for (i in file_names) {
+  holder = read.table(paste("../processed_data/recchia2018_pvulgaris_bam/", i, sep = ""), header = FALSE, sep = "\t")
+  sample_temp = colsplit(rep(i, length(row.names(holder))), pattern = "_", names = c("study", "bam", "sample_name", "file_type"))
+  holder$sample_name = sample_temp$sample_name
+  holder = holder[5:length(row.names(holder)),] #remove the first four rows containing mapping info
+  colnames(holder) = c("gene_id", "unstranded", "forward", "reverse", "sample_name")
+  df = rbind(df, holder)
+}
+
+featurecounts_long = df[,c("gene_id", "unstranded", "sample_name")]
+featurecounts = dcast(featurecounts_long, gene_id ~ sample_name, value.var = "unstranded")
+row.names(featurecounts) = featurecounts$gene_id
+featurecounts = featurecounts[,-c(1)]
+
+#one sample was uploaded into SRA project even though it was not included in their analyses. It is the one with the disproportionately lowest number of bases (351 Mreads vs minimum of 1431M reads). Sample: SRR3215329
+#load metadata
+exp_metadata = read.csv("../metadata/recchia2018_metadata_edited.csv", header = TRUE, row.names = 1)
+exp_metadata = exp_metadata[row.names(exp_metadata) != "SRR3215329",]
+
+#put metadata in order of column names from gene counts matrix
+all(rownames(exp_metadata) %in% colnames(featurecounts)) #check all samples are in counts
+all(rownames(exp_metadata) == colnames(featurecounts)) #check samples are in order
+featurecounts = featurecounts[, rownames(exp_metadata)] #put data in same order if the first is true but the second is false
+
+#order factor levels for DESeq to know which is the reference group
+exp_metadata$myco = factor(exp_metadata$myco, levels = c("control", "myco"))
+exp_metadata$drought = factor(exp_metadata$drought, levels = c("control", "drought"))
+
+#load in orthogroup statistics to identify am-specific orthogroups
+ortho = read.csv("../metadata/orthogroup_mannwhitney.csv", header = TRUE)
+am_ortho = ortho[(ortho$mann_FDR <= 0.05) & (ortho$am_v_nm) > 1,]
+```
+
+## DESeq2
+
+```{r warning = FALSE}
+#load data in to DESeq object
+#expected counts are outputs from RSEM according to Ren et al 2019. As a result, we can round them.
+dds = DESeqDataSetFromMatrix(countData = round(featurecounts),
+                                 colData = exp_metadata,
+                                 design = ~myco*drought
+                                 )
+
+#remove low count reads (optional, but I'm doing it)
+keep = rowSums(counts(dds)) >= 10
+dds = dds[keep,]
+
+#perform differential expression analysis
+dds_analysis = DESeq(dds, test = "LRT", reduced = ~1)
+results = results(dds_analysis, alpha = 0.05)
+int_analysis = DESeq(dds, test = "LRT", reduced = ~myco+drought)
+int_results = results(int_analysis, alpha = 0.05)
+
+#load in genome metadata
+#note: there are duplicates because there are multiple isoforms for each gene in the genome metadata.
+#fix by getting isoform with lowest e-value
+gen_data = read.table("../processed_data/20210823_phaseolus_blast_with_orthogroup.tsv", sep = "\t", header = TRUE)
+gen_data = gen_data[order(gen_data$gene_stable_id, gen_data$evalue, decreasing = FALSE),] #sort by embl_gene to group genes together and then by evalue
+gen_unique <- gen_data[!duplicated(gen_data$gene_stable_id),]
+
+#remove plastid genes
+med_ortho = read.csv("../metadata/orthogroup_identified_AM_medicago_truncatula_genome_metadata.tsv", sep = "\t")
+plastid = med_ortho[med_ortho$X.Replicon.Name == "Pltd",]
+gen_unique = gen_unique[!(gen_unique$orthogroup %in% plastid$Orthogroup),]
+
+#get gene counts per orthogroup in triticum
+gene_counts = gen_unique %>% 
+                group_by(orthogroup) %>%
+                dplyr::summarise(count = n())
+
+am_gene_counts = gene_counts[gene_counts$orthogroup %in% am_ortho$X,]
+
+#merge the deseq data with the genome metadata
+int_results_df = as.data.frame(int_results)
+int_composite = merge(int_results_df, gen_unique, by.x = 0, by.y = "gene_stable_id")
+
+#filter for results only in am-specific orthogroups
+am_int = int_composite[int_composite$orthogroup %in% am_ortho$X,]
+
+#add gene count info to am_int
+am_int = merge(am_int, am_gene_counts, by = "orthogroup")
+
+#add boolean column for whether genes were differentially expressed.
+#used to calculate frequencies
+am_int$de_sig = am_int$padj <= 0.05
+am_int$de_sig[is.na(am_int$de_sig)] = FALSE
+
+#summarise relationship between am-specific orthogroup size and significance
+#mean is used on the count column because this is just duplicated for each orthogroup value
+am_summary = am_int %>%
+  group_by(orthogroup) %>%
+  dplyr::summarise(de_count = sum(de_sig), freq = sum(de_sig)/mean(count), gene_count = mean(count))
+
+#repeat summarization for full dataset to perform permutational analyses
+int_composite = merge(int_composite, gene_counts, by = "orthogroup")
+int_composite$de_sig = int_composite$padj <= 0.05
+int_composite$de_sig[is.na(int_composite$de_sig)] = FALSE
+int_summary = int_composite %>%
+  group_by(orthogroup) %>%
+  dplyr::summarise(de_count = sum(de_sig), freq = sum(de_sig)/mean(count), gene_count = mean(count))
+
+#Plot distributions of gene counts and frequencies in both summarizations to determine if parametric tests are appropriate or if permutational tests must be used
+#AM DE Frequencies
+hist(am_summary$freq)
+
+#AM Gene Counts
+hist(am_summary$gene_count)
+
+#Complete dataset DE Frequencies
+hist(int_summary$freq)
+
+#Complete dataset Gene Counts
+hist(int_summary$gene_count)
+
+#All distributions are heavily skewed. So, parametric tests are not appropriate. Instead, perform permutations from observed distributions to determine if AM relationship is stronger than that observed in complete dataset. Perform permutations to observed if strength of AM relationship is stronger than random.
+
+#observed relationship between am-specific orthogroup size and frequency of significant interactive expression
+(freq_v_gen = cor.test(am_summary$freq, am_summary$gene_count, method = "spearman"))
+
+#Is strength of AM relationship greater than expected from the complete dataset?
+perm_rho = rep(0, 10000)
+for (i in 1:10000) {
+  random_df = int_summary[sample(1:nrow(int_summary), length(am_summary$orthogroup)),]
+  holder = cor.test(random_df$freq, random_df$gene_count, method = "spearman")
+  perm_rho[i] = holder$estimate[[1]]
+}
+dens = density(perm_rho)
+plot(dens, xlim = c(-.5, .5), main = "Is strength of AM relationship greater than expected from the complete dataset?", xlab = "Spearman rho", 
+     frame = FALSE)
+polygon(dens, col = "steelblue")
+abline(v = freq_v_gen$estimate[[1]], col = "black", lwd = 3, lty = 2)
+
+(pvalue = sum(abs(freq_v_gen$estimate[[1]]) <= abs(perm_rho))/length(perm_rho))
+
+#save this to dataframe for comparing all experiments later.
+df_to_save = data.frame(perm_rho, rep(freq_v_gen$estimate, length(perm_rho)), rep("ren2019_root", length(perm_rho)))
+colnames(df_to_save) = c("permuted_rho", "observed_rho", "data_source")
+write.csv(df_to_save, "../processed_data/transcriptome_relationships/recchia2018_root.csv")
+
+#Is strength of AM relationship greater than random?
+perm_rho = rep(0, 10000)
+for (i in 1:10000) {
+  random_count = sample(am_summary$gene_count)
+  holder = cor.test(am_summary$freq, random_count, method = "spearman")
+  perm_rho[i] = holder$estimate[[1]]
+}
+dens = density(perm_rho)
+plot(dens, xlim = c(-.5, .5), main = "Randomized significant interaction frequencies", xlab = "Spearman rho", 
+     frame = FALSE)
+polygon(dens, col = "steelblue")
+abline(v = freq_v_gen$estimate[[1]], col = "black", lwd = 3, lty = 2)
+
+(pvalue = sum(abs(freq_v_gen$estimate[[1]]) <= abs(perm_rho))/length(perm_rho))
+```

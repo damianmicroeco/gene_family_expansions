@@ -1,0 +1,272 @@
+---
+title: "Pretty Plotting - Redo"
+author: "Damian Hernandez"
+date: "2023-11-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preface
+
+The purpose of this script is to create the basic figures for the manuscript before minor edits in Inkscape. The assumed working directory is this folder’s “jobs”. This project folder should be the only project folder referencing other project folders.
+
+I am recreating the original plotting script because we're greatly reengineering the paper's presentation.
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(ComplexHeatmap)
+library(circlize)
+library(stringr)
+library(ggbiplot)
+library(factoextra)
+```
+## Figure 2
+
+The main point of this figure is to show the which genes are conserved in AM-plants as a heatmap with demonstrating that larger gene families have more fitness-associated genetic variation than random and that they are disproportionately targeted for context-dependent regulation than random.
+
+```{r}
+#read in dataframe with mann-whitney stats
+ortho_df = read.csv("../../Results_Sep11/mann_whitney_stats/orthogroups_mannwhitney_sig.csv")
+
+#select orthogroups that are significantly different between AM and NM plants as well as larger in AM plants
+sig_df = ortho_df[(ortho_df$am_v_nm > 1) & (ortho_df$mann_FDR <= 0.05),]
+
+plot_df = sig_df[,1:43]
+colnames(plot_df)[1] = "orthogroup"
+plot_df$orthogroup = factor(plot_df$orthogroup)
+
+#normalize counts for plotting
+plot_df[,2:43] = plot_df[,2:43] / apply(plot_df[,2:43], 1, max)
+
+plot_df = gather(plot_df, species, perc_max, colnames(plot_df)[2]:colnames(plot_df)[length(colnames(plot_df))])
+plot_df$myco = substr(plot_df$species, 1, 2)
+
+#try plotting with ggplot
+ggplot(plot_df, aes(species, orthogroup, fill = perc_max)) +
+  geom_tile() +
+  scale_fill_continuous(low = "white", high = "#f79862")
+
+#try plotting with ComplexHeatmap
+plot_wide = sig_df[,2:43]
+plot_wide = plot_wide / apply(plot_wide, 1, max)
+row.names(plot_wide) = sig_df$X
+
+ha = HeatmapAnnotation(bar = substr(colnames(plot_wide), 1, 2),
+    col = list(bar = c("AM" = "#62F798", "NM" = "#9862F7")))
+col_fun = colorRamp2(c(0, 1), c("white", "#f79862"))
+
+#for data exploration
+Heatmap(as.matrix(plot_wide), top_annotation = ha, col = col_fun, 
+        clustering_distance_columns = "euclidean", clustering_distance_rows = "euclidean",
+        clustering_method_columns = "ward.D2", clustering_method_rows = "ward.D2",
+        column_split = substr(colnames(plot_wide), 1, 2)
+        )
+
+##### for actual pretty plot ####
+ha = HeatmapAnnotation(myco = substr(colnames(plot_wide), 1, 2), col = list(myco = c("AM" = "#62C1F7", "NM" = "#c3e7fc")))
+
+hb = rowAnnotation(ortho_size = anno_lines(rowMeans(sig_df[,2:43])))
+
+col_fun = colorRamp2(c(0, 1), c("white", "#f79862"))
+
+col_labels = substr(colnames(plot_wide), 11, nchar(colnames(plot_wide)))
+col_labels = gsub("_", " ", col_labels)
+col_labels = str_to_sentence(col_labels)
+
+#set-up from the incorrect clustering including the plastid orthogroups for note-taking purposes
+med_ortho = read.csv("../../am_ortho/metadata/orthogroup_identified_AM_medicago_truncatula_genome_metadata.tsv", sep = "\t")
+clust_df = read.csv("../intermediate_data/20220517_heatmap_clustering_noplastid.csv") #from incorrect clustering that had plastid genes
+
+#distribution of orthogroup sizes
+table(clust_df$clust_id)
+
+#after checking the assemblies, it seems that they removed plastid genomic DNA from the ones that are pretty much blank across clusters 4 and 7.
+#after looking at the original papers that did those assemblies, they basically only predicted genes with supported transcriptome data. As a result, plastid genes would not be annotated since they're not poly-adenylated.
+
+#to determine number of k-means
+library(factoextra)
+kplot = scale(plot_wide)
+
+#get within sums of squares to determine optimal number of clusters
+wss = rep(0, 20)
+for (i in 1:(length(wss))) {
+  km = kmeans(kplot, centers = i, nstart = 100)
+  wss[i] = km$tot.withinss
+}
+
+plot(wss)
+
+#the elbow looks to occur at 5-6 clusters. Visual assessment of the plots suggest 6 clusters is a little clearer than 5.
+fviz_cluster(kmeans(kplot, centers = 5, nstart = 100), data = kplot, ellipse.type = "confidence", ellipse.alpha = .5, labelsize = NA)
+fviz_cluster(kmeans(kplot, centers = 6, nstart = 100), data = kplot, ellipse.type = "confidence", ellipse.alpha = .5, labelsize = NA)
+
+ha = HeatmapAnnotation(myco = substr(colnames(plot_wide), 1, 2), col = list(myco = c("AM" = "#62C1F7", "NM" = "#c3e7fc")))
+
+hb = rowAnnotation(ortho_size = anno_lines(rowMeans(sig_df[sig_df$X %in% row.names(plot_wide),2:43])))
+
+col_fun = colorRamp2(c(0, 1), c("white", "#f79862"))
+
+col_labels = substr(colnames(plot_wide), 11, nchar(colnames(plot_wide)))
+col_labels = gsub("_", " ", col_labels)
+col_labels = str_to_sentence(col_labels)
+
+(modheat_fix = Heatmap(as.matrix(plot_wide), top_annotation = ha, right_annotation = hb, col = col_fun, 
+        clustering_distance_columns = "euclidean", clustering_distance_rows = "euclidean",
+        clustering_method_columns = "ward.D2", clustering_method_rows = "ward.D2",
+        column_split = substr(colnames(plot_wide), 1, 2),
+        column_labels = col_labels,
+        row_labels = sig_df$X,
+        show_row_names = FALSE,
+        column_names_gp = gpar(fontface = "italic", fontsize = 8),
+        row_km = 6, row_km_repeats = 100
+  )
+)
+
+#extract orthogroup clusters from k-means clustering to see relationships in PCA if possible
+ortho_clusters = row_order(modheat_fix)
+clust_id = c()
+clust_point = c()
+count = 1
+for (i in ortho_clusters) {
+  clust_id = append(clust_id, rep(names(ortho_clusters[count]), length(i)))
+  clust_point = append(clust_point, i)
+  count = count + 1
+}
+
+clust_df = data.frame(clust_id = clust_id, clust_point = clust_point)
+clust_df = clust_df[order(clust_df$clust_point),]
+clust_df$ortho = sig_df[sig_df$X %in% row.names(plot_wide),]$X
+
+ortho_pca = prcomp(plot_wide, scale. = TRUE)
+
+ggbiplot(ortho_pca, alpha = 0, groups = as.factor(clust_df$clust_id), varname.size = 3, ellipse = TRUE) +
+  geom_point(aes(color = groups), size = rowMeans(sig_df[sig_df$X %in% row.names(plot_wide),2:43]), alpha = .4) +
+  theme_classic()
+
+ha = HeatmapAnnotation(myco = substr(colnames(plot_wide), 1, 2), col = list(myco = c("AM" = "#62C1F7", "NM" = "#c3e7fc")), simple_anno_size = unit(.2, "cm"), show_annotation_name = FALSE)
+
+hb = rowAnnotation(ortho_size = anno_lines(rowMeans(sig_df[sig_df$X %in% row.names(plot_wide),2:43])), show_annotation_name = FALSE)
+
+hc = rowAnnotation(clust = as.factor(clust_df$clust_id), show_annotation_name = FALSE)
+
+col_fun = colorRamp2(c(0, 1), c("white", "#f79862"))
+
+col_labels = substr(colnames(plot_wide), 11, nchar(colnames(plot_wide)))
+col_labels = gsub("_", " ", col_labels)
+col_labels = str_to_sentence(col_labels)
+
+svg("../base_plots/20231205_AMvNM_Heatmap_noplastid.svg", width = 5, height = 5, pointsize = 7)
+Heatmap(as.matrix(plot_wide), top_annotation = ha, right_annotation = hb, left_annotation = hc, col = col_fun, 
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "ward.D2",
+        cluster_rows = FALSE,
+        column_split = substr(colnames(plot_wide), 1, 2),
+        row_split = clust_df$clust_id,
+        column_labels = col_labels,
+        show_row_names = FALSE,
+        column_names_gp = gpar(fontface = "italic", fontsize = 8)
+  )
+dev.off()
+
+#write.csv(clust_df, "../intermediate_data/20220517_heatmap_clustering_noplastid.csv", row.names = FALSE)
+clust_df = read.csv("../intermediate_data/20220517_heatmap_clustering_noplastid.csv")
+
+### ORTHOGROUP BIOLOGY ###
+med_ortho = read.csv("../../am_ortho/metadata/orthogroup_identified_AM_medicago_truncatula_genome_metadata.tsv", sep = "\t")
+
+#cluster 1 (strong difference btw AM and NM and consistency in AM plants)
+clust1 = clust_df[clust_df$clust_id == 1,]
+med1 = med_ortho[med_ortho$Orthogroup %in% clust1$ortho,]
+
+#cluster 2 and 3 (Poaceae differences)
+clust2 = clust_df[clust_df$clust_id == 2,]
+med2 = med_ortho[med_ortho$Orthogroup %in% clust2$ortho,]
+
+clust3 = clust_df[clust_df$clust_id == 3,]
+med3 = med_ortho[med_ortho$Orthogroup %in% clust3$ortho,]
+
+#cluster 4 and 5 (strong differences between AM and NM, but more Brass driven)
+clust4 = clust_df[clust_df$clust_id == 4,]
+med4 = med_ortho[med_ortho$Orthogroup %in% clust4$ortho,]
+
+clust5 = clust_df[clust_df$clust_id == 5,]
+med5 = med_ortho[med_ortho$Orthogroup %in% clust5$ortho,]
+
+#cluster 6 (strong difference btw AM and NM and consistency in AM plants)
+clust6 = clust_df[clust_df$clust_id == 6,]
+med6 = med_ortho[med_ortho$Orthogroup %in% clust6$ortho,]
+
+#convert to long form for statistics
+poaceae = c("AM_refseq_aegilops_tauschii", "AM_refseq_brachypodium_distachyon", "AM_refseq_setaria_italica", "AM_refseq_sorghum_bicolor", "AM_refseq_zea_mays")
+stats_df_prep = function(df) {
+  df_long = gather(df, species, ortho_size)
+  df_long$myco = substr(df_long$species, 1, 2)
+  df_long$poaceae = ifelse(df_long$species %in% poaceae, "poaceae", "not_poaceae")
+  return(df_long)
+}
+
+size1 = stats_df_prep(plot_wide[row.names(plot_wide) %in% clust1$ortho,])
+size2 = stats_df_prep(plot_wide[row.names(plot_wide) %in% clust2$ortho,])
+size3 = stats_df_prep(plot_wide[row.names(plot_wide) %in% clust3$ortho,])
+size4 = stats_df_prep(plot_wide[row.names(plot_wide) %in% clust4$ortho,])
+size5 = stats_df_prep(plot_wide[row.names(plot_wide) %in% clust5$ortho,])
+size6 = stats_df_prep(plot_wide[row.names(plot_wide) %in% clust6$ortho,])
+
+#AM v NM comparison
+p_vals = rep(0, 6)
+w_vals = rep(0, 6)
+p_vals[1] = wilcox.test(ortho_size ~ myco, data = size1)$p.value
+p_vals[2] = wilcox.test(ortho_size ~ myco, data = size2)$p.value
+p_vals[3] = wilcox.test(ortho_size ~ myco, data = size3)$p.value
+p_vals[4] = wilcox.test(ortho_size ~ myco, data = size4)$p.value
+p_vals[5] = wilcox.test(ortho_size ~ myco, data = size5)$p.value
+p_vals[6] = wilcox.test(ortho_size ~ myco, data = size6)$p.value
+
+w_vals[1] = wilcox.test(ortho_size ~ myco, data = size1)$statistic
+w_vals[2] = wilcox.test(ortho_size ~ myco, data = size2)$statistic
+w_vals[3] = wilcox.test(ortho_size ~ myco, data = size3)$statistic
+w_vals[4] = wilcox.test(ortho_size ~ myco, data = size4)$statistic
+w_vals[5] = wilcox.test(ortho_size ~ myco, data = size5)$statistic
+w_vals[6] = wilcox.test(ortho_size ~ myco, data = size6)$statistic
+
+(q_vals = p.adjust(p_vals, method = "fdr"))
+w_vals
+
+#poaceae comparisons
+poaceae_df_prep = function(df) {
+  df_prep = df[df$myco == "AM",]
+  return(df_prep)
+}
+
+po1 = poaceae_df_prep(size1)
+po2 = poaceae_df_prep(size2)
+po3 = poaceae_df_prep(size3)
+po4 = poaceae_df_prep(size4)
+po5 = poaceae_df_prep(size5)
+po6 = poaceae_df_prep(size6)
+
+p_vals = rep(0, 6)
+w_vals = rep(0, 6)
+p_vals[1] = wilcox.test(ortho_size ~ poaceae, data = po1)$p.value
+p_vals[2] = wilcox.test(ortho_size ~ poaceae, data = po2)$p.value
+p_vals[3] = wilcox.test(ortho_size ~ poaceae, data = po3)$p.value
+p_vals[4] = wilcox.test(ortho_size ~ poaceae, data = po4)$p.value
+p_vals[5] = wilcox.test(ortho_size ~ poaceae, data = po5)$p.value
+p_vals[6] = wilcox.test(ortho_size ~ poaceae, data = po6)$p.value
+
+w_vals[1] = wilcox.test(ortho_size ~ poaceae, data = po1)$statistic
+w_vals[2] = wilcox.test(ortho_size ~ poaceae, data = po2)$statistic
+w_vals[3] = wilcox.test(ortho_size ~ poaceae, data = po3)$statistic
+w_vals[4] = wilcox.test(ortho_size ~ poaceae, data = po4)$statistic
+w_vals[5] = wilcox.test(ortho_size ~ poaceae, data = po5)$statistic
+w_vals[6] = wilcox.test(ortho_size ~ poaceae, data = po6)$statistic
+
+(q_vals = p.adjust(p_vals, method = "fdr"))
+w_vals
+```
+

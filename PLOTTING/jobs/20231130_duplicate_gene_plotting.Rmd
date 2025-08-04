@@ -1,0 +1,94 @@
+---
+title: "Duplicate Gene Classification Plotting"
+author: "Damian Hernandez"
+date: "2023-11-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preface
+
+The purpose of this script is to have a central place for plotting the results from the gene duplication analysis.
+
+The assumed working directory is the jobs folder.
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(Hmisc)
+library(patchwork)
+```
+
+## Data Management
+```{r}
+load("../../wgd_analyses/20230817_damian_wgd_working/jobs/20231011_duplicate_gene_classifier_all.RData")
+
+#perform fdr correction
+dup_fdr = dup_p %>%
+  group_by(dup_class) %>%
+  mutate(fdr = p.adjust(p_value, method = "fdr"))
+
+dup_fdr$fdr_bin = dup_fdr$fdr <= 0.05
+
+#remove singletons because we're not interested in these
+dup_fdr = dup_fdr[dup_fdr$dup_class != "singleton",]
+
+#change order of levels to match paper's story
+dup_fdr$dup_class = factor(dup_fdr$dup_class, levels = c("tandem", "proximal", "segmental", "dispersed"))
+
+#add significance variable to the all_rand dataframe so that you can highlight which results were significant
+all_rand_comb = merge(all_rand, dup_fdr, by = c("dup_class", "species"))
+all_rand_comb = all_rand_comb[all_rand_comb$dup_class != "singleton",]
+
+all_rand_comb$dup_class = factor(all_rand_comb$dup_class, levels = c("tandem", "proximal", "segmental", "dispersed"))
+
+species_names = all_rand_comb %>%
+  separate_wider_delim(species, delim = "_", names = c(NA, "genus", "spec"))
+
+species_names = species_names[,c("genus", "spec")]
+species_names$genus = capitalize(species_names$genus)
+all_rand_comb$species_names = paste(species_names$genus, species_names$spec, sep = " ")
+
+am_long = merge(am_long, dup_fdr, by = c("dup_class", "species"))
+```
+
+## Plotting
+```{r}
+#summary plot
+(p1 = ggplot(dup_fdr, aes(fdr, am_observed-rand_mean)) +
+  geom_point(aes(alpha = fdr_bin), color = "#f59761") +
+  scale_alpha_discrete(range = c(.2, 1)) +
+  facet_wrap(vars(dup_class), ncol = 4) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_x_continuous(guide = guide_axis(angle = 90)) +
+  ylab("Observed - Random Mean") +
+  xlab("FDR")
+)
+
+#plotting of random distributions
+(p2 = ggplot(all_rand_comb, aes(species, proportion)) +
+  geom_violin(aes(alpha = fdr_bin), fill = "#f59761") +
+  geom_point(data = am_long[(am_long$species %in% unique(all_rand_comb$species)) & (am_long$dup_class != "singleton"),], aes(species, proportion, alpha = fdr_bin), size = 2) +
+  scale_alpha_discrete(range = c(.2, 1)) +
+  facet_grid(rows = vars(dup_class), scales = "free") +
+  theme_classic() +
+  theme(legend.position = "none") +
+  scale_x_discrete(guide = guide_axis(angle = 90), breaks = unique(all_rand_comb$species), labels = unique(all_rand_comb$species_names)) +
+  theme(axis.text.x = element_text(face = "italic")) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.01)) +
+  ylab("Observed - Random Mean") +
+  xlab(NULL)
+  )
+
+(comb_plot = p1 + p2 + plot_layout(heights = c(2, 5)))
+
+ggsave("../base_plots/20231130_duplication_types_plot.svg", device = "svg", comb_plot, width = 18.4, height = 21, units = "cm")
+```
+
+

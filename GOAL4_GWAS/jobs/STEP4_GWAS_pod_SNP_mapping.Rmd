@@ -1,0 +1,271 @@
+---
+title: "Mapping SNPs to GEA"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preface
+The goal of this script is to map SNPs to the results of the GWAS with performance/fitness data (pod counts). We will load the RData from the GEA analysis.
+
+The assumed working directory is the jobs folder.
+
+```{r}
+library(LEA)
+library(splitstackshape)
+library(GenomicRanges)
+library(dplyr)
+library(ggplot2)
+library(data.table)
+```
+
+## Data Management
+```{r}
+#load GEA data
+load("../processed_data/20220407_GWAS_pod_output/20220407_GWAS_pod.RData")
+
+#load snp coordinates and metadata
+snp_meta = read.csv("../processed_data/20220407_GWAS_pod_output/pod_filteredset2014_cleaned.vcfsnp", sep = " ", header = FALSE)
+
+#load genome annotation
+#hapmap was aligned against Mt 4.0 build.
+gen_anno = read.csv("../metadata/mt4-0_jcvi/data/GCA_000219495.2/genomic.gtf", sep = "\t", header = FALSE, skip = 4)
+
+#drop last row of gen_anno which is formatting from gtf file
+gen_anno = gen_anno[1:(length(row.names(gen_anno))-1),]
+
+#only select "gene" entries. the "exon" entries are subsections of the gene and anything that is not a gene was not used in the analysis.
+gen_anno = gen_anno[gen_anno$V3 == "gene",]
+
+#split description column by ; delimiter
+gen_anno = cSplit(indt = gen_anno, splitCols = "V9", sep = ";")
+```
+
+## Building Genome Maps
+```{r}
+#to match formatting in SNP metadata we need to extract the chromosome and scaffold identity
+gen_anno$V9_1 = gsub("gene_id MTR_", "", gen_anno$V9_1)
+
+#create a column to store whether it was on a chromosome or scaffold
+gen_anno$jcvi_scaf = gen_anno$V9_1
+
+#write whether chromosome or unmapped scaffold
+gen_anno$jcvi_scaf[grepl("g", gen_anno$jcvi_scaf)] = "chr"
+gen_anno$jcvi_scaf[grepl("s", gen_anno$jcvi_scaf)] = "scaffold"
+
+#add chromosome/scaffold id
+scaf_num = strsplit(gen_anno$V9_1, "[gs]")
+gen_anno$jcvi_scaf = paste(gen_anno$jcvi_scaf, sapply(scaf_num, function(x) x[1]), sep = "")
+
+#remove the note string to get the JCVI gene names
+gen_anno$V9_6 = gsub("note ", "", gen_anno$V9_6)
+
+gen_map = gen_anno[,c("jcvi_scaf", "V4", "V5")]
+gen_map = as.data.frame(gen_map)
+rownames(gen_map) = paste(gen_anno$V9_6, as.character(gen_anno$V4), sep = "_")
+```
+
+## Function building
+
+Create functions to convert genomic coordinates that will allow for finding overlap between genes and snps. This is code from the JEFworks lab (https://jef.works/blog/2016/12/06/mapping-snps-and-peaks-to-genes-in-R/).
+
+```{r}
+#' Convert from ranges to GRanges
+#' 
+#' @param df Dataframe with columns as sequence name, start, and end
+#' 
+#' @returns GRanges version 
+#' 
+range2GRanges <- function(df) {
+    require(GenomicRanges)
+    require(IRanges)
+	gr <- GenomicRanges::GRanges(
+        seqnames = df[,1],
+        ranges=IRanges(start = df[,2], end = df[,3])
+        )
+    return(gr)
+}
+```
+
+## Convert coordinates to ranges
+
+```{r}
+#duplicate genomic coordinates of snps in another column to allow creation of Granges.
+snps = snp_meta[,1:2]
+snps$V2 = as.numeric(snps$V2)
+snps$V3 = snps$V2
+
+#convert snp coordinates to Granges
+snp_ranges = range2GRanges(snps)
+names(snp_ranges) = paste(snps$V1, as.character(snps$V2), sep = "_")
+
+#convert genomic coordinates to Granges
+gen_ranges = range2GRanges(gen_map)
+names(gen_ranges) = row.names(gen_map)
+```
+
+## Map SNPs to genome
+```{r}
+overlap = GenomicRanges::findOverlaps(snp_ranges, gen_ranges)
+hits = names(gen_ranges)[slot(overlap, "to")]
+names(hits) = names(snp_ranges)[slot(overlap, "from")]
+
+hits_df = data.frame(names(hits),
+                     hits)
+colnames(hits_df) = c("snp_id", "gen_id")
+
+snps$snp_id = paste(snps$V1, as.character(snps$V2), sep = "_")
+
+#there are duplicated SNPs when merging without filtering hits_df
+#these are all tRNAs which might be a result of the modeling when annotating these short genes. I will only accept the first occurrence of the duplicate for these genes.
+all_snps = merge(snps, hits_df, by = "snp_id", all.x = TRUE)
+all_snps = all_snps %>% 
+  distinct(snp_id, .keep_all = TRUE)
+all_snps = as.data.frame(all_snps)
+```
+
+## Add results from GEA
+```{r}
+#convert genome-corrected but not multiple-test-corrected p-values to dataframe
+gea6p = as.data.frame(test_all6$pvalues)
+gea7p = as.data.frame(test_all7$pvalues)
+gea8p = as.data.frame(test_all8$pvalues)
+
+#for some reason, merging the snps and hits_df dataframes create an extra 58 duplicated rows
+#the differences 
+#cbind snp mappings
+gea6p = cbind(all_snps, gea6p)
+gea7p = cbind(all_snps, gea7p)
+gea8p = cbind(all_snps, gea8p)
+```
+
+## Trial Manhattan plots with within factor FDR correction
+There's no good standard about the best way to do the multiple hypothesis correction. For my purposes, I don't really care if a single SNP is responding to multiple factors and can view responses to individual factors independently. So, I think I can do multiple hypothesis correction within only one factor. 
+
+I'm open to the alternative
+
+```{r}
+test_man = gea7p
+colnames(test_man)[6] = "d_pod"
+
+#bonferroni correction
+for (i in 6:length(colnames(test_man))) {
+  test_man[,i] = p.adjust(as.vector(test_man[,i]), method = "bonferroni")
+}
+
+#make a cumulative bp column for plotting so that the start of the next chromosome is the next cumulative bp
+test_man$V1 = as.factor(test_man$V1)
+max_bp = test_man %>%
+  group_by(V1) %>%
+  summarise(max(V2))
+
+offset_max = as.vector(max_bp$`max(V2)`) #offset the chromosome maxima so these act ast the starts of the next chromosome
+offset_max = c(0, offset_max)
+offset_max = offset_max[-length(offset_max)]
+
+max_bp$offset_max = offset_max
+max_bp$cum_bp_chr = cumsum(offset_max)
+
+test_man = merge(test_man, max_bp, by = "V1")
+test_man$cum_bp = test_man$V2 + test_man$cum_bp_chr
+
+#just for visualization, we will put all the scaffolds in the same group
+test_man$chr = test_man$V1
+test_man$chr = as.character(test_man$chr)
+test_man$chr[grepl("scaffold", test_man$chr)] = "scaffold"
+test_man$chr = as.factor(test_man$chr)
+
+#custom manhattan plots in ggplot
+ggplot(test_man) +
+  geom_point(aes(x = cum_bp, y = -log10(d_pod), color = chr)) +
+  geom_hline(yintercept = -log10(0.05))
+
+#################
+
+test_man = gea7p
+colnames(test_man)[6] = "d_pod"
+
+#fdr correction
+for (i in 6:length(colnames(test_man))) {
+  test_man[,i] = p.adjust(as.vector(test_man[,i]), method = "fdr")
+}
+
+#make a cumulative bp column for plotting so that the start of the next chromosome is the next cumulative bp
+test_man$V1 = as.factor(test_man$V1)
+max_bp = test_man %>%
+  group_by(V1) %>%
+  summarise(max(V2))
+
+offset_max = as.vector(max_bp$`max(V2)`) #offset the chromosome maxima so these act ast the starts of the next chromosome
+offset_max = c(0, offset_max)
+offset_max = offset_max[-length(offset_max)]
+
+max_bp$offset_max = offset_max
+max_bp$cum_bp_chr = cumsum(offset_max)
+
+test_man = merge(test_man, max_bp, by = "V1")
+test_man$cum_bp = test_man$V2 + test_man$cum_bp_chr
+
+#just for visualization, we will put all the scaffolds in the same group
+test_man$chr = test_man$V1
+test_man$chr = as.character(test_man$chr)
+test_man$chr[grepl("scaffold", test_man$chr)] = "scaffold"
+test_man$chr = as.factor(test_man$chr)
+
+#custom manhattan plots in ggplot
+ggplot(test_man) +
+  geom_point(aes(x = cum_bp, y = -log10(d_pod), color = chr)) +
+  geom_hline(yintercept = -log10(0.05))
+```
+
+## Plotting of p-value distribution with 7 populations
+```{r}
+hist(test_man$d_pod)
+```
+## Function for exporting results of SNP genome mapping
+```{r}
+gea_map_export = function(df) {
+  
+  #perform fdr correction
+  for (i in 6:length(colnames(df))) {
+    df[,i] = p.adjust(as.vector(df[,i]), method = "fdr")
+  }
+  
+  #change column names
+  colnames(df)[2:4] = c("snp_chr", "snp_start", "snp_stop")
+  colnames(df)[6] = "d_pod"
+  
+  #make a cumulative bp column for plotting so that the start of the next chromosome is the next cumulative bp
+  df$snp_chr = as.factor(df$snp_chr)
+  max_bp = df %>%
+    group_by(snp_chr) %>%
+    summarise(max(snp_start))
+
+  offset_max = as.vector(max_bp$`max(snp_start)`) #offset the chromosome maxima so these act ast the starts of the next chromosome
+  offset_max = c(0, offset_max)
+  offset_max = offset_max[-length(offset_max)]
+
+  max_bp$offset_max = offset_max
+  max_bp$cum_bp_chr = cumsum(offset_max)
+
+  df = merge(df, max_bp, by = "snp_chr")
+  df$cum_bp = df$snp_start + df$cum_bp_chr
+  
+  #just for visualization, we will put all the scaffolds in the same group
+  df$chr = df$snp_chr
+  df$chr = as.character(df$chr)
+  df$chr[grepl("scaffold", df$chr)] = "scaffold"
+  df$chr = as.factor(df$chr)
+  
+  return(df)
+}
+
+write.csv(gea_map_export(gea6p), "../processed_data/20220407_GWAS_pod_output/20220408_GWASResults_Pod_Mapped_SNPS_6pops.csv", row.names = FALSE)
+
+write.csv(gea_map_export(gea7p), "../processed_data/20220407_GWAS_pod_output/20220408_GWASResults_Pod_Mapped_SNPS_7pops.csv", row.names = FALSE)
+
+write.csv(gea_map_export(gea8p), "../processed_data/20220407_GWAS_pod_output/20220408_GWASResults_Pod_Mapped_SNPS_8pops.csv", row.names = FALSE)
+```
+

@@ -1,0 +1,1565 @@
+---
+title: "Phylogenetically-corrected AM orthogroup identification"
+output: html_document
+date: "2024-11-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preface
+The purpose of this script is to conduct validations of our results using phylogenetically-corrected models of protein size. We did not do this originally because this kind of model is very conservative and is finding universal AM-orthogroups which whether this is the correct approach for our study is questionable because AM+ status is the ancestral state from 450 million years ago so it's been presumably been extensively modified in lineages over such a long time and would have been lost in multiple different ways in non-mycorrhizal plants. Nevertheless, doing this check is good since, if the results are consistent with this more conservative selection, then our results are robust.
+
+The biggest change to our pipeline will just be the orthogroup classification into AM and not AM orthogroups. All the other data like which genes are context-dependently expressed, if they have sigantures of selection, etc. were all calculated without the AM orthogroup status. The AM orthogroup status was only used for mapping gene family sizes and doing the permutational correlation tests.
+
+The assumed working directory is the validation_jobs folder which is above all the GOAL folders.
+
+```{r}
+library(phyr)
+library(tidyr)
+library(ape)
+library(DESeq2)
+library(dplyr)
+library(reshape2)
+library(splitstackshape)
+library(ggplot2)
+library(car)
+library(Hmisc)
+```
+
+## Orthogroup Selection
+
+```{r}
+#read in gene counts
+gene_counts = read.csv("../GOAL2_orthogroup_analysis/Orthogroups.GeneCount.csv", sep = "\t")
+colnames(gene_counts)[1] = "ortho"
+
+#remove the total column
+gene_counts$Total = NULL
+
+#for phylogenetic models, convert data to long-form
+gene_long = gene_counts %>%
+  pivot_longer(!ortho, names_to = "species", values_to = "count")
+
+#mycorrhizal status is just the first two characters of the species names
+gene_long$myco = substr(gene_long$species, 1, 2)
+
+#read in midpoint-rooted tree
+spec_tree = read.tree("../GOAL2_orthogroup_analysis/Orthologues_Sep12/SpeciesTree_rooted_node_labels.txt")
+
+#run phylogenetically-corrected model to ask which gene families change in size between AM and NM plants. since we are using count data, we will use a poisson distribution
+#for this round I am using gaussian because poisson family fails when data is invariable in one of the groups (particularly when all NM are 0 which is the kind of orthogroup were interested in)
+model_out = list(rep(0, length(unique(gene_long$ortho))))
+for (i in 1:length(unique(gene_long$ortho))) {
+  current_ortho = unique(gene_long$ortho)[i]
+  model_out[[i]] = pglmm(count ~ myco + (1|species),
+                       data = gene_long[gene_long$ortho == current_ortho,],
+                       cov_ranef = list(species = spec_tree),
+                       family = "gaussian")  
+}
+
+#save model p-values to dataframe
+model_res = data.frame(matrix(nrow = length(unique(gene_long$ortho)), ncol = 3))
+colnames(model_res) = c("ortho", "zscore", "pvalue")
+
+model_res$ortho = unique(gene_long$ortho)
+for (i in 1: length(unique(gene_long$ortho))) {
+  model_res[i, 2] = model_out[[i]]$B.zscore[2]
+  model_res[i, 3] = model_out[[i]]$B.pvalue[2]
+}
+
+#gene families that are invariable have model outputs that are NAs, let's convert the p-values to 1 and z-scores to 0 which is effectively what they are
+model_res[is.na(model_res$pvalue), "pvalue"] = 1
+model_res[is.na(model_res$zscore), "zscore"] = 0
+
+model_res$fdr = p.adjust(model_res$pvalue, method = "fdr")
+
+am_res = model_res[(model_res$fdr <= 0.05),]
+am_res = am_res[(am_res$zscore < 0),]
+
+#how different are these phylogenetically-corrected results from the original set?
+og_am = read.csv("../GOAL2_orthogroup_analysis/orthogroups_mannwhitney_sig.csv")
+og_am = og_am[(og_am$am_v_nm > 1),]
+
+#remove plastid genes
+gen_data = read.table("../GOAL3_context_dependent_expression_analysis/metadata/orthogroup_identified_AM_medicago_truncatula_genome_metadata.tsv", 
+                      sep = "\t", header = TRUE, comment.char = "", quote = "") #tell it to ignore the #
+gen_data = gen_data[gen_data$X.Replicon.Name == "Pltd",]
+
+am_res = am_res[!(am_res$ortho %in% gen_data$Orthogroup),]
+og_am = og_am[!(og_am$X %in% gen_data$Orthogroup),]
+
+length(intersect(am_res$ortho, og_am$X))
+
+write.csv(am_res, "processed_data/am_res.csv", row.names = FALSE)
+```
+
+## Context-Dependent Expression Analyses
+### Calabrese 2019 (Phosphorus, Populus trichocarpa)
+```{r warning = FALSE}
+#clear environment
+rm(list = ls())
+
+#merge the two experimental dataframes of raw feature counts
+featurecounts = read.csv("../GOAL3_context_dependent_expression_analysis/raw_data/calabrese_2019/GSE138316_Processed_Populus_preppedforinput.csv", row.names = 1, header = TRUE, sep = "\t")
+
+#sum counts for each transcript to get values for gene
+transcript_split = colsplit(row.names(featurecounts), "\\.", c("species", "gene", "transcript"))
+featurecounts$gene_id = paste(transcript_split$species, transcript_split$gene, sep = ".")
+featurecounts = featurecounts %>%
+  group_by(gene_id) %>%
+  summarise_all(list(sum))
+featurecounts = as.data.frame(featurecounts)
+row.names(featurecounts) = featurecounts$gene_id
+featurecounts = featurecounts[, -c(1)]
+
+#load metadata
+exp_metadata = read.csv("../GOAL3_context_dependent_expression_analysis/metadata/calabrese2019_metadata.csv", header = TRUE, row.names = 1)
+
+#put metadata in order of column names from gene counts matrix
+all(rownames(exp_metadata) %in% colnames(featurecounts)) #check all samples are in counts
+all(rownames(exp_metadata) == colnames(featurecounts)) #check samples are in order
+featurecounts = featurecounts[, rownames(exp_metadata)] #put data in same order if the first is true but the second is false
+
+#order factor levels for DESeq to know which is the reference group
+exp_metadata$myco = factor(exp_metadata$myco, levels = c("control", "myco"))
+exp_metadata$phosphorus = factor(exp_metadata$phosphorus, levels = c("high", "low"))
+
+#load in orthogroup statistics to identify am-specific orthogroups
+ortho = read.csv("processed_data/am_res.csv", header = TRUE)
+am_ortho = ortho
+
+#load data in to DESeq object
+dds = DESeqDataSetFromMatrix(countData = featurecounts,
+                                 colData = exp_metadata,
+                                 design = ~myco*phosphorus
+                                 )
+
+#remove low count reads (optional, but I'm doing it)
+keep = rowSums(counts(dds)) >= 10
+dds = dds[keep,]
+
+#perform differential expression analysis
+dds_analysis = DESeq(dds, test = "LRT", reduced = ~1)
+results = results(dds_analysis, alpha = 0.05)
+int_analysis = DESeq(dds, test = "LRT", reduced = ~myco+phosphorus)
+int_results = results(int_analysis, alpha = 0.05)
+
+#load in genome metadata
+#note: there are duplicates because there are multiple isoforms for each gene in the genome metadata.
+#fix by getting isoform with lowest e-value
+gen_data = read.table("../GOAL3_context_dependent_expression_analysis/processed_data/20210718_populus_blast_with_orthogroup.tsv", 
+                      sep = "\t", header = TRUE, comment.char = "", quote = "") #tell it to ignore the #
+gen_data = gen_data[order(gen_data$gene_stable_id, gen_data$evalue, decreasing = FALSE),] #sort by populus gene_stable_id to group genes together and then by evalue
+
+gen_unique <- gen_data[!duplicated(gen_data$gene_stable_id),]
+
+#remove plastid genes
+med_ortho = read.csv("../GOAL3_context_dependent_expression_analysis/metadata/orthogroup_identified_AM_medicago_truncatula_genome_metadata.tsv", sep = "\t")
+plastid = med_ortho[med_ortho$X.Replicon.Name == "Pltd",]
+gen_unique = gen_unique[!(gen_unique$orthogroup %in% plastid$Orthogroup),]
+
+#merge the rlog data with the genomic metadata
+#note: some rna-seq reads aren't in the genomic metadata
+#note2: I checked a random set of 10 and these genes don't have protein products because they're either pseudo-genes or non-coding RNA
+int_results_df = as.data.frame(int_results)
+int_composite = merge(int_results_df, gen_unique, by.x = 0, by.y = "gene_stable_id")
+int_composite$de_sig = int_composite$padj <= .05
+int_composite$de_sig[is.na(int_composite$de_sig)] = FALSE
+
+#get gene counts per orthogroup in refseq
+gene_counts = gen_unique %>% 
+                group_by(orthogroup) %>%
+                dplyr::summarise(count = n())
+
+am_gene_counts = gene_counts[gene_counts$orthogroup %in% am_ortho$ortho,]
+
+#filter for results only in am-specific orthogroups
+am_int = int_composite[int_composite$orthogroup %in% am_ortho$ortho,]
+
+#add gene count info to am_int
+am_int = merge(am_int, am_gene_counts, by = "orthogroup")
+
+#add boolean column for whether genes were differentially expressed.
+#used to calculate frequencies
+am_int$de_sig = am_int$padj <= 0.05
+am_int$de_sig[is.na(am_int$de_sig)] = FALSE
+
+#summarise relationship between am-specific orthogroup size and significance
+#mean is used on the count column because this is just duplicated for each orthogroup value
+am_summary = am_int %>%
+  group_by(orthogroup) %>%
+  dplyr::summarise(de_count = sum(de_sig), freq = sum(de_sig)/mean(count), gene_count = mean(count))
+
+#repeat summarization for full dataset to perform permutational analyses
+int_composite = merge(int_composite, gene_counts, by = "orthogroup")
+int_summary = int_composite %>%
+  group_by(orthogroup) %>%
+  dplyr::summarise(de_count = sum(de_sig), freq = sum(de_sig)/mean(count), gene_count = mean(count))
+
+#Plot distributions of gene counts and frequencies in both summarizations to determine if parametric tests are appropriate or if permutational tests must be used
+#AM DE Frequencies
+hist(am_summary$freq)
+
+#AM Gene Counts
+hist(am_summary$gene_count)
+
+#Complete dataset DE Frequencies
+hist(int_summary$freq)
+
+#Complete dataset Gene Counts
+hist(int_summary$gene_count)
+
+#All distributions are heavily skewed. So, parametric tests are not appropriate. Instead, perform permutations from observed distributions to determine if AM relationship is stronger than that observed in complete dataset. Perform permutations to observed if strength of AM relationship is stronger than random.
+
+#observed relationship between am-specific orthogroup size and frequency of significant interactive expression
+(freq_v_gen = cor.test(am_summary$freq, am_summary$gene_count, method = "spearman"))
+
+#Is strength of AM relationship greater than expected from the complete dataset?
+perm_rho = rep(0, 10000)
+for (i in 1:10000) {
+  random_df = int_summary[sample(1:nrow(int_summary), length(am_summary$orthogroup)),]
+  holder = cor.test(random_df$freq, random_df$gene_count, method = "spearman")
+  perm_rho[i] = holder$estimate[[1]]
+}
+perm_rho[is.na(perm_rho)] = 0 #some values may be NA. convert to zero which means no relationship.
+dens = density(perm_rho) 
+plot(dens, xlim = c(-.5, .5), main = "Is strength of AM relationship greater than expected from the complete dataset?", xlab = "Spearman rho", 
+     frame = FALSE)
+polygon(dens, col = "steelblue")
+abline(v = freq_v_gen$estimate[[1]], col = "black", lwd = 3, lty = 2)
+
+(pvalue = sum(abs(freq_v_gen$estimate[[1]]) <= abs(perm_rho))/length(perm_rho))
+
+#save this to dataframe for comparing all experiments later.
+df_to_save = data.frame(perm_rho, rep(freq_v_gen$estimate, length(perm_rho)), rep("calabrese2019_root", length(perm_rho)))
+colnames(df_to_save) = c("permuted_rho", "observed_rho", "data_source")
+write.csv(df_to_save, "processed_data/calabrese2019_root.csv")
+
+#Is strength of AM relationship greater than random?
+perm_rho = rep(0, 10000)
+for (i in 1:10000) {
+  random_count = sample(am_summary$gene_count)
+  holder = cor.test(am_summary$freq, random_count, method = "spearman")
+  perm_rho[i] = holder$estimate[[1]]
+}
+dens = density(perm_rho)
+plot(dens, xlim = c(-.5, .5), main = "Randomized significant interaction frequencies", xlab = "Spearman rho", 
+     frame = FALSE)
+polygon(dens, col = "steelblue")
+abline(v = freq_v_gen$estimate[[1]], col = "black", lwd = 3, lty = 2)
+
+(pvalue = sum(abs(freq_v_gen$estimate[[1]]) <= abs(perm_rho))/length(perm_rho))
+```
+
+### Garcia 2017 (Potassium, Medicago truncatula)
+```{r warning = FALSE}
+#clear environment
+rm(list = ls())
+
+#merge the two experimental dataframes of raw feature counts
+featurecounts = read.csv("../GOAL3_context_dependent_expression_analysis/raw_data/garcia2017_featurecounts_refseq.txt", row.names = 1, header = TRUE, sep = "\t")
+gene_metadata = featurecounts[, c(1:5)]
+featurecounts = featurecounts[,-c(1:5)]
+
+#replace column names to just have their SRR IDs to match with metadata
+srr_names_unedit = colnames(featurecounts)
+srr_names = sapply(strsplit(srr_names_unedit, ".", fixed = TRUE), "[", 2)
+colnames(featurecounts) = srr_names
+
+#load metadata
+exp_metadata = read.csv("../GOAL3_context_dependent_expression_analysis/metadata/garcia2017_metadata.csv", header = TRUE, row.names = 1)
+
+#put metadata in order of column names from gene counts matrix
+all(rownames(exp_metadata) %in% colnames(featurecounts)) #check all samples are in counts
+all(rownames(exp_metadata) == colnames(featurecounts)) #check samples are in order
+featurecounts = featurecounts[, rownames(exp_metadata)] #put data in same order if the first is true but the second is false
+
+#order factor levels for DESeq to know which is the reference group
+exp_metadata$growth_protocol = factor(exp_metadata$growth_protocol, levels = c("control", "K"))
+exp_metadata$inoculation = factor(exp_metadata$inoculation, levels = c("control", "R"))
+
+#load in orthogroup statistics to identify am-specific orthogroups
+ortho = read.csv("processed_data/am_res.csv")
+am_ortho = ortho
+
+#load data in to DESeq object
+dds = DESeqDataSetFromMatrix(countData = featurecounts,
+                                 colData = exp_metadata,
+                                 design = ~growth_protocol*inoculation
+                                 )
+
+#remove low count reads (optional, but I'm doing it)
+keep = rowSums(counts(dds)) >= 10
+dds = dds[keep,]
+
+#perform differential expression analysis
+dds_analysis = DESeq(dds, test = "LRT", reduced = ~1)
+
+
+results = results(dds_analysis, alpha = 0.05)
+int_analysis = DESeq(dds, test = "LRT", reduced = ~growth_protocol+inoculation)
+int_results = results(int_analysis, alpha = 0.05)
+
+#load in genome metadata
+#note: there are duplicates because there are multiple isoforms for each gene in the genome metadata.
+#fix by getting isoform with lowest e-value
+gen_data = read.table("../GOAL3_context_dependent_expression_analysis/metadata/orthogroup_identified_AM_medicago_truncatula_genome_metadata.tsv", 
+                      sep = "\t", header = TRUE, comment.char = "", quote = "") #tell it to ignore the #
+
+#remove plastid genes
+gen_data = gen_data[gen_data$X.Replicon.Name != "Pltd",]
+
+#create column for merging dataframes
+gen_data$gene_locus = paste("gene-", gen_data$Locus, sep = "")
+
+#merge the rlog data with the genomic metadata
+#note: some rna-seq reads aren't in the genomic metadata
+#note2: I checked a random set of 10 and these genes don't have protein products because they're either pseudo-genes or non-coding RNA
+int_results_df = as.data.frame(int_results)
+int_composite = merge(int_results_df, gen_data, by.x = 0, by.y = "gene_locus")
+int_composite$de_sig = int_composite$padj <= .05
+int_composite$de_sig[is.na(int_composite$de_sig)] = FALSE
+
+#get gene counts per orthogroup in refseq
+gene_counts = gen_data %>% 
+                group_by(Orthogroup) %>%
+                dplyr::summarise(count = n())
+
+am_gene_counts = gene_counts[gene_counts$Orthogroup %in% am_ortho$ortho,]
+
+#filter for results only in am-specific orthogroups
+am_int = int_composite[int_composite$Orthogroup %in% am_ortho$ortho,]
+
+#add gene count info to am_int
+am_int = merge(am_int, am_gene_counts, by = "Orthogroup")
+
+#add boolean column for whether genes were differentially expressed.
+#used to calculate frequencies
+am_int$de_sig = am_int$padj <= 0.05
+am_int$de_sig[is.na(am_int$de_sig)] = FALSE
+
+#summarise relationship between am-specific orthogroup size and significance
+#mean is used on the count column because this is just duplicated for each orthogroup value
+am_summary = am_int %>%
+  group_by(Orthogroup) %>%
+  dplyr::summarise(de_count = sum(de_sig), freq = sum(de_sig)/mean(count), gene_count = mean(count))
+
+#repeat summarization for full dataset to perform permutational analyses
+int_composite = merge(int_composite, gene_counts, by = "Orthogroup")
+int_summary = int_composite %>%
+  group_by(Orthogroup) %>%
+  dplyr::summarise(de_count = sum(de_sig), freq = sum(de_sig)/mean(count), gene_count = mean(count))
+
+#Plot distributions of gene counts and frequencies in both summarizations to determine if parametric tests are appropriate or if permutational tests must be used
+#AM DE Frequencies
+hist(am_summary$freq)
+
+#AM Gene Counts
+hist(am_summary$gene_count)
+
+#Complete dataset DE Frequencies
+hist(int_summary$freq)
+
+#Complete dataset Gene Counts
+hist(int_summary$gene_count)
+
+#All distributions are heavily skewed. So, parametric tests are not appropriate. Instead, perform permutations from observed distributions to determine if AM relationship is stronger than that observed in complete dataset. Perform permutations to observed if strength of AM relationship is stronger than random.
+
+#observed relationship between am-specific orthogroup size and frequency of significant interactive expression
+(freq_v_gen = cor.test(am_summary$freq, am_summary$gene_count, method = "spearman"))
+
+#Is strength of AM relationship greater than expected from the complete dataset?
+perm_rho = rep(0, 10000)
+for (i in 1:10000) {
+  random_df = int_summary[sample(1:nrow(int_summary), length(am_summary$Orthogroup)),]
+  holder = cor.test(random_df$freq, random_df$gene_count, method = "spearman")
+  perm_rho[i] = holder$estimate[[1]]
+}
+perm_rho[is.na(perm_rho)] = 0 #some values were NA. convert to zero which means no relationship.
+dens = density(perm_rho) 
+plot(dens, xlim = c(-.5, .5), main = "Is strength of AM relationship greater than expected from the complete dataset?", xlab = "Spearman rho", 
+     frame = FALSE)
+polygon(dens, col = "steelblue")
+abline(v = freq_v_gen$estimate[[1]], col = "black", lwd = 3, lty = 2)
+
+(pvalue = sum(abs(freq_v_gen$estimate[[1]]) <= abs(perm_rho))/length(perm_rho))
+
+#save this to dataframe for comparing all experiments later.
+df_to_save = data.frame(perm_rho, rep(freq_v_gen$estimate, length(perm_rho)), rep("garcia2017_root", length(perm_rho)))
+colnames(df_to_save) = c("permuted_rho", "observed_rho", "data_source")
+write.csv(df_to_save, "processed_data/garcia2017_root.csv")
+
+#Is strength of AM relationship greater than random?
+perm_rho = rep(0, 10000)
+for (i in 1:10000) {
+  random_count = sample(am_summary$gene_count)
+  holder = cor.test(am_summary$freq, random_count, method = "spearman")
+  perm_rho[i] = holder$estimate[[1]]
+}
+dens = density(perm_rho)
+plot(dens, xlim = c(-.5, .5), main = "Randomized significant interaction frequencies", xlab = "Spearman rho", 
+     frame = FALSE)
+polygon(dens, col = "steelblue")
+abline(v = freq_v_gen$estimate[[1]], col = "black", lwd = 3, lty = 2)
+
+(pvalue = sum(abs(freq_v_gen$estimate[[1]]) <= abs(perm_rho))/length(perm_rho))
+```
+
+### Recchia 2018 (Drought, Phaseoulus vulgaris)
+```{r warning = FALSE}
+#clear environment
+rm(list = ls())
+
+#merge the counts from the different dataframes
+file_names = list.files("../GOAL3_context_dependent_expression_analysis/processed_data/recchia2018_pvulgaris_bam/", pattern = "*.tab")
+
+df = data.frame(gene_id = character(),
+                unstranded = numeric(),
+                forward = numeric(),
+                reverse = numeric(),
+                sample_names = character())
+for (i in file_names) {
+  holder = read.table(paste("../GOAL3_context_dependent_expression_analysis/processed_data/recchia2018_pvulgaris_bam/", i, sep = ""), header = FALSE, sep = "\t")
+  sample_temp = colsplit(rep(i, length(row.names(holder))), pattern = "_", names = c("study", "bam", "sample_name", "file_type"))
+  holder$sample_name = sample_temp$sample_name
+  holder = holder[5:length(row.names(holder)),] #remove the first four rows containing mapping info
+  colnames(holder) = c("gene_id", "unstranded", "forward", "reverse", "sample_name")
+  df = rbind(df, holder)
+}
+
+featurecounts_long = df[,c("gene_id", "unstranded", "sample_name")]
+featurecounts = dcast(featurecounts_long, gene_id ~ sample_name, value.var = "unstranded")
+row.names(featurecounts) = featurecounts$gene_id
+featurecounts = featurecounts[,-c(1)]
+
+#one sample was uploaded into SRA project even though it was not included in their analyses. It is the one with the disproportionately lowest number of bases (351 Mreads vs minimum of 1431M reads). Sample: SRR3215329
+#load metadata
+exp_metadata = read.csv("../GOAL3_context_dependent_expression_analysis/metadata/recchia2018_metadata_edited.csv", header = TRUE, row.names = 1)
+exp_metadata = exp_metadata[row.names(exp_metadata) != "SRR3215329",]
+
+#put metadata in order of column names from gene counts matrix
+all(rownames(exp_metadata) %in% colnames(featurecounts)) #check all samples are in counts
+all(rownames(exp_metadata) == colnames(featurecounts)) #check samples are in order
+featurecounts = featurecounts[, rownames(exp_metadata)] #put data in same order if the first is true but the second is false
+
+#order factor levels for DESeq to know which is the reference group
+exp_metadata$myco = factor(exp_metadata$myco, levels = c("control", "myco"))
+exp_metadata$drought = factor(exp_metadata$drought, levels = c("control", "drought"))
+
+#load in orthogroup statistics to identify am-specific orthogroups
+ortho = read.csv("processed_data/am_res.csv")
+am_ortho = ortho
+
+#load data in to DESeq object
+#expected counts are outputs from RSEM according to Ren et al 2019. As a result, we can round them.
+dds = DESeqDataSetFromMatrix(countData = round(featurecounts),
+                                 colData = exp_metadata,
+                                 design = ~myco*drought
+                                 )
+
+#remove low count reads (optional, but I'm doing it)
+keep = rowSums(counts(dds)) >= 10
+dds = dds[keep,]
+
+#perform differential expression analysis
+dds_analysis = DESeq(dds, test = "LRT", reduced = ~1)
+results = results(dds_analysis, alpha = 0.05)
+int_analysis = DESeq(dds, test = "LRT", reduced = ~myco+drought)
+int_results = results(int_analysis, alpha = 0.05)
+
+#load in genome metadata
+#note: there are duplicates because there are multiple isoforms for each gene in the genome metadata.
+#fix by getting isoform with lowest e-value
+gen_data = read.table("../GOAL3_context_dependent_expression_analysis/processed_data/20210823_phaseolus_blast_with_orthogroup.tsv", sep = "\t", header = TRUE)
+gen_data = gen_data[order(gen_data$gene_stable_id, gen_data$evalue, decreasing = FALSE),] #sort by embl_gene to group genes together and then by evalue
+gen_unique <- gen_data[!duplicated(gen_data$gene_stable_id),]
+
+#remove plastid genes
+med_ortho = read.csv("../GOAL3_context_dependent_expression_analysis/metadata/orthogroup_identified_AM_medicago_truncatula_genome_metadata.tsv", sep = "\t")
+plastid = med_ortho[med_ortho$X.Replicon.Name == "Pltd",]
+gen_unique = gen_unique[!(gen_unique$orthogroup %in% plastid$Orthogroup),]
+
+#get gene counts per orthogroup in triticum
+gene_counts = gen_unique %>% 
+                group_by(orthogroup) %>%
+                dplyr::summarise(count = n())
+
+am_gene_counts = gene_counts[gene_counts$orthogroup %in% am_ortho$ortho,]
+
+#merge the deseq data with the genome metadata
+int_results_df = as.data.frame(int_results)
+int_composite = merge(int_results_df, gen_unique, by.x = 0, by.y = "gene_stable_id")
+
+#filter for results only in am-specific orthogroups
+am_int = int_composite[int_composite$orthogroup %in% am_ortho$ortho,]
+
+#add gene count info to am_int
+am_int = merge(am_int, am_gene_counts, by = "orthogroup")
+
+#add boolean column for whether genes were differentially expressed.
+#used to calculate frequencies
+am_int$de_sig = am_int$padj <= 0.05
+am_int$de_sig[is.na(am_int$de_sig)] = FALSE
+
+#summarise relationship between am-specific orthogroup size and significance
+#mean is used on the count column because this is just duplicated for each orthogroup value
+am_summary = am_int %>%
+  group_by(orthogroup) %>%
+  dplyr::summarise(de_count = sum(de_sig), freq = sum(de_sig)/mean(count), gene_count = mean(count))
+
+#repeat summarization for full dataset to perform permutational analyses
+int_composite = merge(int_composite, gene_counts, by = "orthogroup")
+int_composite$de_sig = int_composite$padj <= 0.05
+int_composite$de_sig[is.na(int_composite$de_sig)] = FALSE
+int_summary = int_composite %>%
+  group_by(orthogroup) %>%
+  dplyr::summarise(de_count = sum(de_sig), freq = sum(de_sig)/mean(count), gene_count = mean(count))
+
+#Plot distributions of gene counts and frequencies in both summarizations to determine if parametric tests are appropriate or if permutational tests must be used
+#AM DE Frequencies
+hist(am_summary$freq)
+
+#AM Gene Counts
+hist(am_summary$gene_count)
+
+#Complete dataset DE Frequencies
+hist(int_summary$freq)
+
+#Complete dataset Gene Counts
+hist(int_summary$gene_count)
+
+#All distributions are heavily skewed. So, parametric tests are not appropriate. Instead, perform permutations from observed distributions to determine if AM relationship is stronger than that observed in complete dataset. Perform permutations to observed if strength of AM relationship is stronger than random.
+
+#observed relationship between am-specific orthogroup size and frequency of significant interactive expression
+(freq_v_gen = cor.test(am_summary$freq, am_summary$gene_count, method = "spearman"))
+
+#Is strength of AM relationship greater than expected from the complete dataset?
+perm_rho = rep(0, 10000)
+for (i in 1:10000) {
+  random_df = int_summary[sample(1:nrow(int_summary), length(am_summary$orthogroup)),]
+  holder = cor.test(random_df$freq, random_df$gene_count, method = "spearman")
+  perm_rho[i] = holder$estimate[[1]]
+}
+dens = density(perm_rho)
+plot(dens, xlim = c(-.5, .5), main = "Is strength of AM relationship greater than expected from the complete dataset?", xlab = "Spearman rho", 
+     frame = FALSE)
+polygon(dens, col = "steelblue")
+abline(v = freq_v_gen$estimate[[1]], col = "black", lwd = 3, lty = 2)
+
+(pvalue = sum(abs(freq_v_gen$estimate[[1]]) <= abs(perm_rho))/length(perm_rho))
+
+#save this to dataframe for comparing all experiments later.
+df_to_save = data.frame(perm_rho, rep(freq_v_gen$estimate, length(perm_rho)), rep("ren2019_root", length(perm_rho)))
+colnames(df_to_save) = c("permuted_rho", "observed_rho", "data_source")
+write.csv(df_to_save, "processed_data/recchia2018_root.csv")
+
+#Is strength of AM relationship greater than random?
+perm_rho = rep(0, 10000)
+for (i in 1:10000) {
+  random_count = sample(am_summary$gene_count)
+  holder = cor.test(am_summary$freq, random_count, method = "spearman")
+  perm_rho[i] = holder$estimate[[1]]
+}
+dens = density(perm_rho)
+plot(dens, xlim = c(-.5, .5), main = "Randomized significant interaction frequencies", xlab = "Spearman rho", 
+     frame = FALSE)
+polygon(dens, col = "steelblue")
+abline(v = freq_v_gen$estimate[[1]], col = "black", lwd = 3, lty = 2)
+
+(pvalue = sum(abs(freq_v_gen$estimate[[1]]) <= abs(perm_rho))/length(perm_rho))
+```
+
+### Ren 2019 (Salinity, Sesbania cannabina)
+```{r warning = FALSE}
+#clear environment
+rm(list = ls())
+
+#merge the counts from the different dataframes
+file_names = list.files("../GOAL3_context_dependent_expression_analysis/raw_data/ren_2019/", pattern = "*.txt")
+featurecounts_long = do.call(rbind, lapply(paste("../GOAL3_context_dependent_expression_analysis/raw_data/ren_2019/", file_names, sep = ""), read.table, sep = "\t", header = TRUE))
+featurecounts_long = featurecounts_long[, -c(4)]
+featurecounts = dcast(featurecounts_long, gene_id ~ Sample_name, value.var = "Read_count")
+row.names(featurecounts) = featurecounts$gene_id
+featurecounts = featurecounts[,-c(1)]
+
+#load metadata
+exp_metadata = read.csv("../GOAL3_context_dependent_expression_analysis/metadata/ren2019_metadata.csv", header = TRUE, row.names = 1)
+
+#put metadata in order of column names from gene counts matrix
+all(rownames(exp_metadata) %in% colnames(featurecounts)) #check all samples are in counts
+all(rownames(exp_metadata) == colnames(featurecounts)) #check samples are in order
+featurecounts = featurecounts[, rownames(exp_metadata)] #put data in same order if the first is true but the second is false
+
+#order factor levels for DESeq to know which is the reference group
+exp_metadata$myco = factor(exp_metadata$myco, levels = c("control", "myco"))
+exp_metadata$salinity = factor(exp_metadata$salinity, levels = c("control", "salinity"))
+exp_metadata$time = factor(exp_metadata$time, levels = c(0, 3, 27))
+
+#split datasets into roots and leaves and analyze separately
+exp_root = exp_metadata[exp_metadata$tissue == "root",]
+exp_leaf = exp_metadata[exp_metadata$tissue == "shoot",]
+
+featurecounts_root = featurecounts[, colnames(featurecounts) %in% row.names(exp_root)]
+featurecounts_leaf = featurecounts[, colnames(featurecounts) %in% row.names(exp_leaf)]
+
+all(rownames(exp_root) %in% colnames(featurecounts_root)) #check all samples are in counts
+all(rownames(exp_root) == colnames(featurecounts_root)) #check samples are in order
+all(rownames(exp_leaf) %in% colnames(featurecounts_leaf)) #check all samples are in counts
+all(rownames(exp_leaf) == colnames(featurecounts_leaf)) #check samples are in order
+
+#load in orthogroup statistics to identify am-specific orthogroups
+ortho = read.csv("processed_data/am_res.csv")
+am_ortho = ortho
+
+#load data in to DESeq object
+#expected counts are outputs from RSEM according to Ren et al 2019. As a result, we can round them.
+dds = DESeqDataSetFromMatrix(countData = round(featurecounts_root),
+                                 colData = exp_root,
+                                 design = ~myco*time #Ask Michelle
+                                 )
+
+#remove low count reads (optional, but I'm doing it)
+keep = rowSums(counts(dds)) >= 10
+dds = dds[keep,]
+
+#perform differential expression analysis
+dds_analysis = DESeq(dds, test = "LRT", reduced = ~1)
+results = results(dds_analysis, alpha = 0.05)
+int_analysis = DESeq(dds, test = "LRT", reduced = ~myco+time)
+int_results = results(int_analysis, alpha = 0.05)
+
+#load in genome metadata
+#note: there are duplicates because there are multiple isoforms for each gene in the genome metadata.
+#fix by getting isoform with lowest e-value
+gen_data = read.table("../GOAL3_context_dependent_expression_analysis/processed_data/20210713_sesbania_cannabina_blast_with_orthogroup.tsv", sep = "\t", header = TRUE)
+gen_data = gen_data[order(gen_data$sesbania_gene, gen_data$evalue, decreasing = FALSE),] #sort by sesbania_gene to group genes together and then by evalue
+gen_unique <- gen_data[!duplicated(gen_data$sesbania_gene),] #this should be the same length as gen_data
+
+#get gene counts per orthogroup in triticum
+gene_counts = gen_unique %>% 
+                group_by(orthogroup) %>%
+                dplyr::summarise(count = n())
+
+#remove plastid genes
+med_ortho = read.csv("../GOAL3_context_dependent_expression_analysis/metadata/orthogroup_identified_AM_medicago_truncatula_genome_metadata.tsv", sep = "\t")
+plastid = med_ortho[med_ortho$X.Replicon.Name == "Pltd",]
+gene_counts = gene_counts[!(gene_counts$orthogroup %in% plastid$Orthogroup),]
+
+am_gene_counts = gene_counts[gene_counts$orthogroup %in% am_ortho$ortho,]
+
+#merge the deseq data with the genome metadata
+int_results_df = as.data.frame(int_results)
+int_composite = merge(int_results_df, gen_unique, by.x = 0, by.y = "sesbania_gene")
+
+#filter for results only in am-specific orthogroups
+am_int = int_composite[int_composite$orthogroup %in% am_ortho$ortho,]
+
+#add gene count info to am_int
+am_int = merge(am_int, am_gene_counts, by = "orthogroup")
+
+#add boolean column for whether genes were differentially expressed.
+#used to calculate frequencies
+am_int$de_sig = am_int$padj <= 0.05
+am_int$de_sig[is.na(am_int$de_sig)] = FALSE
+
+#summarise relationship between am-specific orthogroup size and significance
+#mean is used on the count column because this is just duplicated for each orthogroup value
+am_summary = am_int %>%
+  group_by(orthogroup) %>%
+  dplyr::summarise(de_count = sum(de_sig), freq = sum(de_sig)/mean(count), gene_count = mean(count))
+
+#repeat summarization for full dataset to perform permutational analyses
+int_composite = merge(int_composite, gene_counts, by = "orthogroup")
+int_composite$de_sig = int_composite$padj <= 0.05
+int_composite$de_sig[is.na(int_composite$de_sig)] = FALSE
+int_summary = int_composite %>%
+  group_by(orthogroup) %>%
+  dplyr::summarise(de_count = sum(de_sig), freq = sum(de_sig)/mean(count), gene_count = mean(count))
+
+#Plot distributions of gene counts and frequencies in both summarizations to determine if parametric tests are appropriate or if permutational tests must be used
+#AM DE Frequencies
+hist(am_summary$freq)
+
+#AM Gene Counts
+hist(am_summary$gene_count)
+
+#Complete dataset DE Frequencies
+hist(int_summary$freq)
+
+#Complete dataset Gene Counts
+hist(int_summary$gene_count)
+
+#All distributions are heavily skewed. So, parametric tests are not appropriate. Instead, perform permutations from observed distributions to determine if AM relationship is stronger than that observed in complete dataset. Perform permutations to observed if strength of AM relationship is stronger than random.
+
+#observed relationship between am-specific orthogroup size and frequency of significant interactive expression
+(freq_v_gen = cor.test(am_summary$freq, am_summary$gene_count, method = "spearman"))
+
+#Is strength of AM relationship greater than expected from the complete dataset?
+perm_rho = rep(0, 10000)
+for (i in 1:10000) {
+  random_df = int_summary[sample(1:nrow(int_summary), length(am_summary$orthogroup)),]
+  holder = cor.test(random_df$freq, random_df$gene_count, method = "spearman")
+  perm_rho[i] = holder$estimate[[1]]
+}
+dens = density(perm_rho)
+plot(dens, xlim = c(-.5, .5), main = "Is strength of AM relationship greater than expected from the complete dataset?", xlab = "Spearman rho", 
+     frame = FALSE)
+polygon(dens, col = "steelblue")
+abline(v = freq_v_gen$estimate[[1]], col = "black", lwd = 3, lty = 2)
+
+(pvalue = sum(abs(freq_v_gen$estimate[[1]]) <= abs(perm_rho))/length(perm_rho))
+
+#save this to dataframe for comparing all experiments later.
+df_to_save = data.frame(perm_rho, rep(freq_v_gen$estimate, length(perm_rho)), rep("ren2019_root", length(perm_rho)))
+colnames(df_to_save) = c("permuted_rho", "observed_rho", "data_source")
+write.csv(df_to_save, "processed_data/ren2019_root.csv")
+
+#Is strength of AM relationship greater than random?
+perm_rho = rep(0, 10000)
+for (i in 1:10000) {
+  random_count = sample(am_summary$gene_count)
+  holder = cor.test(am_summary$freq, random_count, method = "spearman")
+  perm_rho[i] = holder$estimate[[1]]
+}
+dens = density(perm_rho)
+plot(dens, xlim = c(-.5, .5), main = "Randomized significant interaction frequencies", xlab = "Spearman rho", 
+     frame = FALSE)
+polygon(dens, col = "steelblue")
+abline(v = freq_v_gen$estimate[[1]], col = "black", lwd = 3, lty = 2)
+
+(pvalue = sum(abs(freq_v_gen$estimate[[1]]) <= abs(perm_rho))/length(perm_rho))
+```
+
+## Larger AM Gene Families as genetic hotspots
+
+```{r warning=FALSE}
+#clear environment
+rm(list = ls())
+
+#load in GEA results with SNP mappings to genes
+gea6p = read.csv("../GOAL4_GWAS/processed_data/20220407_GWAS_pod_output/20220408_GWASResults_Pod_Mapped_SNPS_6pops.csv")
+gea7p = read.csv("../GOAL4_GWAS/processed_data/20220407_GWAS_pod_output/20220408_GWASResults_Pod_Mapped_SNPS_7pops.csv")
+gea8p = read.csv("../GOAL4_GWAS/processed_data/20220407_GWAS_pod_output/20220408_GWASResults_Pod_Mapped_SNPS_8pops.csv")
+
+#split the gen id to get the jcvi id
+gea6p = cbind(gea6p, colsplit(gea6p$gen_id, pattern = "_", names = c("jcvi", "gen_start")))
+gea7p = cbind(gea8p, colsplit(gea7p$gen_id, pattern = "_", names = c("jcvi", "gen_start")))
+gea8p = cbind(gea8p, colsplit(gea8p$gen_id, pattern = "_", names = c("jcvi", "gen_start")))
+
+
+#load in map of JCVI gene IDs to RefSeq
+jcvi = read.csv("../GOAL4_GWAS/metadata/Medicago_truncatula.MedtrA17_4.0.52.refseq.tsv", sep = "\t")
+ortho = read.csv("../GOAL4_GWAS/metadata/orthogroup_identified_AM_medicago_truncatula_genome_metadata.tsv", sep = "\t")
+blast_res = read.csv("../GOAL4_GWAS/metadata/20210706_medicago_blast_with_orthogroup.tsv", sep = "\t")
+blast_res$X = NULL
+
+#fix jcvi id prefix to match that in HapMap
+jcvi$gene_stable_id = gsub("MTR_", "Medtr", jcvi$gene_stable_id)
+jcvi = jcvi[grepl("Medtr", jcvi$gene_stable_id),]
+
+#merge jcvi ids to ortho-identified refseq IDs
+ortho = merge(jcvi, ortho, by.x = "xref", by.y = "Protein.product", all.x = TRUE)
+blast_res = merge(jcvi, blast_res, by.x = "gene_stable_id", by.y = "jcvi", all.x = TRUE)
+
+#filter dataframe to only have genes with refseq protein products
+ortho = ortho[grepl("XP_", ortho$xref),]
+blast_res = blast_res[grepl("XP_", blast_res$xref),]
+
+#there are a lot of genes that don't match to RefSeq IDs in the original ortho dataframe.
+#I checked 12 of them and they were all removed as part of standard genome annotation.
+#I will use the results from the BLAST matching which retained most of the annotated genes in the JCVI annotation and genes that did not have a BLAST match to something in an orthogroup was just lumped into "not_in_refseq"
+#some genes still do not a match to a RefSeq in the BLAST (~5%). They were mostly genes removed during the genome annotation process. I will remove them from the dataframe here and reclassify them when mapping to GEA results as "not_in_refseq".
+blast_res = blast_res[complete.cases(blast_res),]
+
+#use a reduced dataframe that only keeps the jcvi IDs (for matching to GEA results) and the orthogroup identity
+#there will be some duplicates because, in the original jcvi dataframe, different isoforms were provided or each gene.
+#because we matched by gene id, all the different isoforms will have the same orthogroup identity which is based on the longest isoform
+blast_res = blast_res[,c("gene_stable_id","orthogroup")]
+
+blast_res = blast_res %>%
+  distinct(.keep_all = TRUE)
+
+#for the first set of analyses, we are excluding intergenic SNPs and not expanding the range of the genome annotations
+gea6p = gea6p[!is.na(gea6p$jcvi),]
+gea7p = gea7p[!is.na(gea7p$jcvi),]
+gea8p = gea8p[!is.na(gea8p$jcvi),]
+
+#add orthogroup identities
+gea6p = merge(gea6p, blast_res, by.x = "jcvi", by.y = "gene_stable_id", all.x = TRUE)
+gea7p = merge(gea7p, blast_res, by.x = "jcvi", by.y = "gene_stable_id", all.x = TRUE)
+gea8p = merge(gea8p, blast_res, by.x = "jcvi", by.y = "gene_stable_id", all.x = TRUE)
+
+#place NAs in orthogroup column in broader "not_in_refseq"
+gea6p[is.na(gea6p$orthogroup),"orthogroup"] = "not_in_refseq"
+gea7p[is.na(gea7p$orthogroup),"orthogroup"] = "not_in_refseq"
+gea8p[is.na(gea8p$orthogroup),"orthogroup"] = "not_in_refseq"
+
+#to make things easier for me to read, let's remove unnecessary columns
+gea6p = gea6p[,c("jcvi", "d_pod", "orthogroup")]
+gea7p = gea7p[,c("jcvi", "d_pod", "orthogroup")]
+gea8p = gea8p[,c("jcvi", "d_pod", "orthogroup")]
+
+
+#convert FDR corrected p-values to binary
+gea6p[,2] = (gea6p[,2] < 0.05)*1
+gea7p[,2] = (gea7p[,2] < 0.05)*1
+gea8p[,2] = (gea8p[,2] < 0.05)*1
+
+#calculate number of significant SNPs for each gene
+sig_snp = function(df) {
+  df = df %>%
+    group_by(orthogroup, jcvi) %>%
+    summarise_all(list(sum))
+  return(df)
+}
+gea6p = as.data.frame(sig_snp(gea6p))
+gea7p = as.data.frame(sig_snp(gea7p))
+gea8p = as.data.frame(sig_snp(gea8p))
+
+#get gene lengths to normalize snp variation
+gene_meta = read.csv("../GOAL4_GWAS/metadata/mt4-0_jcvi/data/GCA_000219495.2/genomic.gtf", sep = "\t", header = FALSE, skip = 4)
+
+#drop last row of gene_meta which is formatting from gtf file
+gene_meta = gene_meta[1:(length(row.names(gene_meta))-1),]
+
+#only select "gene" entries. the "exon" entries are subsections of the gene and anything that is not a gene was not used in the analysis.
+gene_meta = gene_meta[gene_meta$V3 == "gene",]
+
+#split description column by ; delimiter
+gene_meta = cSplit(indt = gene_meta, splitCols = "V9", sep = ";")
+
+#subset gene_meta to only relevant columns
+gene_meta = gene_meta[,c(4,5,14)]
+colnames(gene_meta) = c("jcvi_start", "jcvi_stop", "jcvi")
+gene_meta$jcvi = gsub("note ", "", gene_meta$jcvi)
+gene_meta$jcvi_len = abs(gene_meta$jcvi_stop - gene_meta$jcvi_start)
+
+#for duplicate gene ids, only select the longest annotation
+gene_meta = gene_meta %>%
+  group_by(jcvi) %>%
+  summarise(jcvi_len = max(jcvi_len))
+
+#add gene lengths to SNP dataframes
+gea6p = merge(gea6p, gene_meta, by = "jcvi", all.x = TRUE)
+gea7p = merge(gea7p, gene_meta, by = "jcvi", all.x = TRUE)
+gea8p = merge(gea8p, gene_meta, by = "jcvi", all.x = TRUE)
+
+#normalize snp variation by gene length
+norm6p = gea6p
+norm7p = gea7p
+norm8p = gea8p
+
+norm6p[,3] = norm6p[,3]/norm6p$jcvi_len
+norm7p[,3] = norm7p[,3]/norm7p$jcvi_len
+norm8p[,3] = norm8p[,3]/norm8p$jcvi_len
+
+#load orthogroup identity
+am_ortho = read.csv("../GOAL4_GWAS/metadata/orthogroup_mannwhitney.csv")
+am_res = read.csv("processed_data/am_res.csv")
+
+ortho_ident = (am_ortho$X %in% am_res$ortho)
+ortho_ident[ortho_ident == TRUE] = "AM"
+ortho_ident[ortho_ident == "FALSE"] = "NM"
+am_ortho$am_ident = ortho_ident
+
+am_ortho = am_ortho[,c("X", "am_ident")]
+colnames(am_ortho)[1] = "orthogroup"
+
+#add orthogroup identities to normalized dataframes
+norm6p = merge(norm6p, am_ortho, by = "orthogroup", all.x = TRUE)
+norm7p = merge(norm7p, am_ortho, by = "orthogroup", all.x = TRUE)
+norm8p = merge(norm8p, am_ortho, by = "orthogroup", all.x = TRUE)
+
+#summarise counts based on jcvi annotations for the orthogroups
+#orthogroup identities are consistent across the normalized dataframes
+ortho_count = norm6p %>%
+  group_by(orthogroup) %>%
+  summarise(gene_count = n())
+
+norm6p = merge(norm6p, ortho_count, by = "orthogroup", all.x = TRUE)
+norm7p = merge(norm7p, ortho_count, by = "orthogroup", all.x = TRUE)
+norm8p = merge(norm8p, ortho_count, by = "orthogroup", all.x = TRUE)
+
+#for this set of analyses remove genes that were not matched to RefSeq genes
+ref6p = norm6p[norm6p$orthogroup != "not_in_refseq",]
+ref7p = norm7p[norm7p$orthogroup != "not_in_refseq",]
+ref8p = norm8p[norm8p$orthogroup != "not_in_refseq",]
+
+#get list of am-specific orthogroups
+am_spec = am_ortho$orthogroup[am_ortho$am_ident == "AM"]
+am_spec = am_spec[am_spec %in% unique(ref6p$orthogroup)]
+
+#calculate observed correlations of am-specific orthogroup size and amount of variation
+obs6p = rep(0,1)
+obs7p = rep(0,1)
+obs8p = rep(0,1)
+env_names = colnames(norm6p)[3]
+obs_df = data.frame(row.names = env_names,
+                    obs6p = obs6p,
+                    obs7p = obs7p,
+                    obs8p = obs8p)
+
+obs_corr = function(obs_out, ref_in, out_col) {
+  for(i in row.names(obs_out)) {
+    snp_var = ref_in[ref_in$am_ident == "AM", i]
+    ortho_size = ref_in[ref_in$am_ident == "AM","gene_count"]
+    test = cor.test(as.vector(snp_var), as.vector(ortho_size), method = "spearman")
+    obs_out[i, out_col] = test$estimate[[1]]
+  }
+  return(obs_out)
+}
+
+obs_df = obs_corr(obs_df, ref6p, "obs6p")
+obs_df = obs_corr(obs_df, ref7p, "obs7p")
+obs_df = obs_corr(obs_df, ref8p, "obs8p")
+
+#calculate randomized relationship between orthogroup size and snp variation with random subsampling of orthogroups
+env_fact = rep(row.names(obs_df), each = 10000)
+env_fact = c(env_fact, env_fact, env_fact)
+gea = rep(c("gea6p", "gea7p", "gea8p"), each = 10000*length(row.names(obs_df)))
+
+samp_df = data.frame(perm_count = rep(1:10000, times = length(row.names(obs_df))*3),
+                     rand_rho = rep(0, length(row.names(obs_df))*3*10000), #creates an empty column to fill with 10000 permutations by the number of factors by the number of GEAs with different ancestral populations
+                     env_fact = env_fact,
+                     gea = gea
+                     )
+
+samp_corr = function(refin_1, refin_2, refin_3, df_out){
+  #samp_ortho variables will randomly select from all orthogroups the same number of orthogroups that are am-specific
+  for (i in 1:length(row.names(df_out))){
+    samp_ortho = sample(unique(refin_1$orthogroup), length(am_spec))
+    if (df_out$gea[i] == "gea6p"){
+      snp_var = refin_1[refin_1$orthogroup %in% samp_ortho, df_out$env_fact[i]]
+      ortho_size = refin_1[refin_1$orthogroup %in% samp_ortho, "gene_count"]
+      test = cor.test(as.vector(snp_var), as.vector(ortho_size), method = "spearman")
+      df_out[i, "rand_rho"] = test$estimate[[1]]
+    }
+    else if (df_out$gea[i] == "gea7p"){
+      snp_var = refin_2[refin_2$orthogroup %in% samp_ortho, df_out$env_fact[i]]
+      ortho_size = refin_2[refin_2$orthogroup %in% samp_ortho, "gene_count"]
+      test = cor.test(as.vector(snp_var), as.vector(ortho_size), method = "spearman")
+      df_out[i, "rand_rho"] = test$estimate[[1]]
+    }
+    else if (df_out$gea[i] == "gea8p"){
+      snp_var = refin_3[refin_3$orthogroup %in% samp_ortho, df_out$env_fact[i]]
+      ortho_size = refin_3[refin_3$orthogroup %in% samp_ortho, "gene_count"]
+      test = cor.test(as.vector(snp_var), as.vector(ortho_size), method = "spearman")
+      df_out[i, "rand_rho"] = test$estimate[[1]]
+    }
+    else {
+      print("Something went wrong.")
+    }
+  }
+  return(df_out)
+}
+
+samp_df = samp_corr(ref6p, ref7p, ref8p, samp_df)
+
+#fill in column for observed values
+samp_df$obs_rho = 0
+
+for (i in row.names(obs_df)){
+  samp_df[(samp_df$env_fact == i) & (samp_df$gea == "gea6p"),"obs_rho"] = obs_df[i,"obs6p"]
+  samp_df[(samp_df$env_fact == i) & (samp_df$gea == "gea7p"),"obs_rho"] = obs_df[i,"obs7p"]
+  samp_df[(samp_df$env_fact == i) & (samp_df$gea == "gea8p"),"obs_rho"] = obs_df[i,"obs8p"]
+}
+
+#create boolean column asking if random is greater than or equal to observed
+samp_df$great_rand = (samp_df$rand_rho >= samp_df$obs_rho)*1
+
+#summarise by sum of number of random rhos greater than observed
+samp_summary = samp_df %>%
+  group_by(gea, env_fact) %>%
+  summarise(great_rand = list(sum(great_rand)))
+
+samp_summary$great_rand = as.numeric(samp_summary$great_rand)
+samp_summary$p_value = samp_summary$great_rand/10000
+
+#split into the different geas for fdr correction (maybe?)
+summary6p = samp_summary[samp_summary$gea == "gea6p",]
+summary7p = samp_summary[samp_summary$gea == "gea7p",]
+summary8p = samp_summary[samp_summary$gea == "gea8p",]
+
+summary6p$fdr = p.adjust(summary6p$p_value, method = "fdr")
+summary7p$fdr = p.adjust(summary7p$p_value, method = "fdr")
+summary8p$fdr = p.adjust(summary8p$p_value, method = "fdr")
+
+samp_summary = rbind(summary6p, summary7p, summary8p)
+
+#order factors for plotting. Group soil characteristics together for interpretation
+samp_summary$gea = factor(samp_summary$gea, levels = c("gea6p", "gea7p", "gea8p"))
+samp_summary$env_fact = factor(samp_summary$env_fact, levels = c("d_pod"))
+
+samp_df$gea = factor(samp_df$gea, levels = c("gea6p", "gea7p", "gea8p"))
+samp_df$env_fact = factor(samp_df$env_fact, levels = c("d_pod"))
+
+#summarise by sum of number of random rhos greater than observed
+obs_long = samp_df %>%
+  group_by(gea, env_fact) %>%
+  summarise(obs_rho = list(mean(obs_rho)))
+obs_long$obs_rho = as.numeric(obs_long$obs_rho)
+
+samp_summary$fdr_plot = paste("FDR: ", as.character(round(samp_summary$fdr, 4)), sep = "")
+
+ggplot(data = samp_df) +
+  facet_grid(rows = vars(env_fact), cols = vars(gea)) +
+  geom_histogram(aes(rand_rho), fill = "#c3af97") +
+  geom_vline(data = obs_long, aes(xintercept = obs_rho), linetype = "dashed", size = 1) +
+  geom_text(data = samp_summary, aes(-.05, 1000, label = fdr_plot), size = 3) +
+  theme_classic()
+
+plot7 = samp_df[samp_df$gea == "gea7p",]
+
+#get upper cut-off for 95% of randomized data to plot where the significance threshold is in the violing plot
+quant_df = plot7 %>%
+  group_by(env_fact) %>%
+  summarise(quant95 = quantile(rand_rho, c(.95)))
+
+#reorder summary7p to match the order in the plot
+summary7 = samp_summary[samp_summary$gea == "gea7p",]
+summary7 = summary7[match(quant_df$env_fact, summary7$env_fact),]
+summary7$p_plot = paste("p = ", as.character(round(summary7$p_value, 4)), sep = "")
+
+# ggplot(plot7, aes(x = env_fact, y = rand_rho)) +
+#   geom_violin(aes(alpha = env_fact), fill = "#f79862") +
+#   scale_alpha_manual(values = c(1, 1, 1, .5, .5)) +
+#   geom_point(data = obs_long[obs_long$gea == "gea7p",], aes(x = env_fact, y = obs_rho), size = 4, alpha = c(1, 1, 1, .5, .5)) +
+#   geom_segment(data = quant_df, aes(x = seq(0.5, 4.5, by = 1), xend = seq(1.5, 5.5, by = 1), y = as.vector(quant_df$quant95), yend = as.vector(quant_df$quant95)), color = "black") +
+#   labs(x = "Environmental Factor", y = "Randomized Spearman's \u03C1") +
+#   scale_x_discrete(labels = c("Labile P", "Soil N", "Soil pH", "Highest Precipitation", "Temperature Range")) +
+#   annotate("text", x = 1:5, y = .27, label = summary7$p_plot) +
+#   theme_classic() +
+#   theme(legend.position = "none") 
+
+ggplot(plot7, aes(x = env_fact, y = rand_rho)) +
+  geom_violin(fill = "#f79862") +
+  geom_point(data = obs_long[obs_long$gea == "gea7p",], aes(x = env_fact, y = obs_rho), size = 4) +
+  geom_segment(data = quant_df, aes(x = c(0.5), xend = c(1.5), y = as.vector(quant_df$quant95), yend = as.vector(quant_df$quant95)), color = "black") +
+  labs(x = "Environmental Factor", y = "Randomized Spearman's \u03C1") +
+  scale_x_discrete(labels = c("Impact on Pod Counts")) +
+  annotate("text", x = 1, y = .27, label = summary7$p_plot) +
+  theme_classic() +
+  theme(legend.position = "none")
+
+## Could AM orthogroups be unique in size?
+size_df = data.frame(perm_count = rep(1:10000),
+                     rand_size = rep(0, 10000)
+                     )
+
+ortho_size_df = ref7p %>%
+  group_by(orthogroup) %>%
+  summarise(avg_size = mean(gene_count))
+    
+for (i in 1:10000) {
+  size_df[i,"rand_size"] = mean(sample(ortho_size_df$avg_size, length(am_spec)))
+}
+
+hist(size_df$rand_size)
+abline(v = mean(ortho_size_df[ortho_size_df$orthogroup %in% am_spec,]$avg_size))
+
+sum(size_df$rand_size > mean(ortho_size_df[ortho_size_df$orthogroup %in% am_spec,]$avg_size))/10000
+
+### Repeat SNP variation relationships by relating SNP variation ACROSS the whole orthogroup
+ortho7 = gea7p[gea7p$orthogroup != "not_in_refseq", 2:length(colnames(gea7p))]
+
+ortho7 = group_by(ortho7, orthogroup) %>%
+  summarise_all(sum)
+
+ortho7[,2] = ortho7[,2]/ortho7$jcvi_len
+
+ortho_corr = rep(0,1)
+names(ortho_corr) = colnames(ortho7[,2])
+
+ortho7 = merge(ortho7, ortho_count, by = "orthogroup", all.x = TRUE)
+
+for (i in colnames(ortho7)[2]) {
+  holder = ortho7[ortho7$orthogroup %in% am_spec,]
+  holder_test = cor.test(as.vector(holder[,i]), holder$gene_count, method = "spearman")
+  ortho_corr[i] = holder_test$estimate
+}
+
+#subsampling analysis
+env_fact = rep("d_pod", each = 10000)
+
+samp_df_ortho = data.frame(perm_count = rep(1:10000, times = 1),
+                     rand_rho = rep(0, 10000), #creates an empty column to fill with 10000 permutations by the number of factors by the number of GEAs with different ancestral populations
+                     env_fact = env_fact
+                     )
+
+for (i in 1:length(row.names(samp_df_ortho))) {
+  ortho_samp = sample(ortho7$orthogroup, length(am_spec))
+  holder = ortho7[ortho7$orthogroup %in% ortho_samp,]
+  holder_test = cor.test(as.vector(holder[,samp_df_ortho[i,"env_fact"]]), holder$gene_count, method = "spearman")
+  samp_df_ortho[i,"rand_rho"] = holder_test$estimate
+}
+
+#plotting
+ortho_corr = as.data.frame(ortho_corr)
+ortho_corr$env_fact = row.names(ortho_corr)
+
+ortho_quant_df =  samp_df_ortho %>%
+  group_by(env_fact) %>%
+  summarise(quant95 = quantile(rand_rho, c(.95)))
+
+samp_df_ortho$env_fact = factor(samp_df_ortho$env_fact, levels = c("d_pod"))
+ortho_corr$env_fact = factor(ortho_corr$env_fact, levels = c("d_pod"))
+ortho_quant_df$env_fact = factor(ortho_quant_df$env_fact, levels = c("d_pod"))
+
+#reorder ortho_corr and ortho_quant_df to match the order for plotting
+ortho_corr = ortho_corr[order(ortho_corr$env_fact),]
+ortho_quant_df = ortho_quant_df[order(ortho_quant_df$env_fact),]
+
+ortho_p = merge(samp_df_ortho, ortho_corr, by = "env_fact")
+ortho_p$ortho_bool = (ortho_p$rand_rho >= ortho_p$ortho_corr) * 1
+ortho_p = group_by(ortho_p, env_fact) %>%
+  summarise(p_value = sum(ortho_bool)/10000)
+ortho_p$p_plot = paste("p = ", as.character(round(ortho_p$p_value, 4)), sep = "")
+  
+ggplot(samp_df_ortho, aes(x = env_fact, y = rand_rho)) +
+  geom_violin(fill = "#f79862") +
+  geom_point(data = ortho_corr, aes(x = env_fact, y = ortho_corr), size = 4) +
+  geom_segment(data = ortho_quant_df, aes(x = c(0.5), xend = c(1.5), y = quant95, yend = quant95), color = "black") +
+  labs(x = "Environmental Factor", y = "Randomized Spearman's \u03C1") +
+  scale_x_discrete(labels = c("Impact on Pod Counts")) +
+  annotate("text", x = 1, y = .45, label = ortho_p$p_plot) +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+
+## Gene Duplication Analyses
+
+```{r}
+#clear environment
+rm(list = ls())
+
+#Modified from https://www.r-bloggers.com/2012/11/expand-delimited-columns-in-r/ to expand the comma delimited columns in the Orthogroup metadata.
+#For some reason, I can't get cSplit in splitstackshape to do it correctly. Even though I call the species column with the orthogroup metadata, it keeps trying to split up the orthogroup ID column.
+
+#Function to expand data
+expand.delimited <- function(x, col1, col2, sep=",") {
+  rnum <- 1
+  expand_row <- function(y) {
+    factr <- y[col1]
+    strng <- toString(y[col2])
+    expand <- strsplit(strng, sep)[[1]]
+    num <- length(expand)
+    factor <- rep(factr,num)
+    return(as.data.frame(cbind(factor,expand),
+          row.names=seq(rnum:(rnum+num)-1)))
+    rnum <- (rnum+num)-1
+  }
+  expanded <- apply(x,1,expand_row)
+  df <- do.call("rbind", expanded)
+  names(df) <- c(names(x)[col1],names(x)[col2])
+  return(df)
+}
+
+#get list of species that were in OrthoFinder analysis
+am_ortho_df = read.csv("../GOAL5_duplication_origin_analysis/metadata/orthogroup_mannwhitney.csv")
+
+specs = colnames(am_ortho_df)[grepl("AM_", colnames(am_ortho_df))]
+
+#get list of AM orthogroups
+am_ortho = read.csv("processed_data/am_res.csv")
+
+#dir.create("processed_data/duplication_tables")
+
+for (spec in specs) {
+  ref_label = spec
+  spec = gsub("_refseq", "", spec)
+  
+  df_c = read.table(paste("../GOAL5_duplication_origin_analysis/processed_data/",spec,"/",spec,".gff", sep = ""), sep = "\t")
+  colnames(df_c) = c("chrom", "gene", "start", "end")
+  
+  #get orthogroup classifications
+  orth_c = read.table("../GOAL5_duplication_origin_analysis/metadata/Orthogroups.csv", sep = "\t", header = TRUE)
+  
+  #reduce orthogroup dataframe to species of interest
+  orth_c = orth_c[,c("X", ref_label)]
+  
+  #remove orthogroups that don't occur in the species
+  orth_c = orth_c[orth_c[, ref_label] != "",]
+  
+  #remove whitespace in species column
+  orth_c[,ref_label] = gsub('\\s+', '', orth_c[,ref_label])
+  
+  #expand gene id info into columns
+  orth_c = data.frame(expand.delimited(orth_c, "X", ref_label))
+  colnames(orth_c) = c("ortho", "gene")
+  
+  #use refseq ID as gene name to match gff file
+  orth_c = orth_c %>% 
+    separate(gene, c("gi_name", "gi", "ref", "gene", "blank"), "\\|") %>%
+    select(c(ortho, gene))
+  
+  #add orthogroup information to bed file
+  df_c = merge(df_c, orth_c, by = "gene", all.x = TRUE)
+  
+  #For now I am going to remove those with NAs in the ortho column and move on with doing the duplicate gene classification.
+  df_c = df_c[!is.na(df_c$ortho),]
+  
+  #for this round I am removing scaffolds that have less than three genes (i.e., the minimum for determining wgd/segmental duplication)
+  #discuss with Michelle if this is a good idea because it's unclear what kind of duplication event they would be part of.
+  chrom_count = df_c %>%
+    group_by(chrom) %>%
+    summarise(count = n())
+  
+  chrom_ok = chrom_count$chrom[chrom_count$count >= 3]
+  
+  df_c = df_c[df_c$chrom %in% chrom_ok,]
+  
+  #group by chromosome/scaffold
+  df_c = df_c %>%
+    group_by(chrom)
+  
+  #sort chromosome by gene start
+  df_c = df_c %>%
+    arrange(start, .by_group = TRUE)
+  
+  #remove mitochondrial/plastid chromosomes if there are any
+  df_c = df_c[!grepl("YP", df_c$gene),]
+  
+  #get gene ranks along chromosome
+  df_c = df_c %>%
+    mutate(rank = rank(start))
+  
+  #create empty columns to store booleans for the different gene duplication classes
+  df_c$singleton = TRUE
+  df_c$dispersed = FALSE
+  df_c$proximal = FALSE
+  df_c$tandem = FALSE
+  df_c$segmental = FALSE
+  
+  ## DISPERSED
+  #So, if a gene is dispersed it must have an orthogroup size larger than 1.
+  #We will first make all non-singleton orthogroups dispersed and then change the classification as we go through the tests for the higher priority classificiations
+  ortho_mult = df_c %>%
+    ungroup() %>%
+    group_by(ortho) %>%
+    summarise(count = n())
+  
+  ortho_mult_vec = ortho_mult$ortho[ortho_mult$count > 1]
+  
+  df_c$singleton[df_c$ortho %in% ortho_mult_vec] = FALSE
+  df_c$dispersed[df_c$ortho %in% ortho_mult_vec] = TRUE
+  
+  ## TANDEM/PROXIMAL
+  #Now we will reclassify the dispersed classifications is genes are tandem or proximal. Meaning that genes are either next to each other (tandem) or separated by 20 genes or less (proximal; original MCScanX paper, but can be changed).
+  
+  #make vector of orthogroups that cannot be tandem or proximal
+  #vector of orthogroups that only occur once on each chromosome (i.e., singleton or not possible to be close to each other since they are on separate chromosomes)
+  ortho_chrom_count = df_c %>%
+    ungroup() %>%
+    group_by(chrom, ortho) %>%
+    summarise(count = n()) %>%
+    ungroup() %>%
+    group_by(ortho) %>%
+    summarise(max = max(count))
+  
+  too_far = ortho_chrom_count$ortho[ortho_chrom_count$max == 1]
+  
+  #to speed up pairwise difference calculations, let's remove the ones that absolutely cannot be tandem/proximal
+  temp_df = df_c[!(df_c$ortho %in% too_far),]
+  
+  #for each orthogroup within a chromosome, make a numeric matrix of pairwise differences in rank
+  dist_df = data.frame(row = factor(), col = factor(), value = numeric())
+  for (c in unique(temp_df$chrom)) {
+    holder = temp_df[temp_df$chrom == c,]
+    for (o in unique(holder$ortho)) {
+      holder2 = holder[holder$ortho == o,]
+      ranks = holder2$rank
+      names(ranks) = holder2$gene
+      dist_hold = melt(as.matrix(dist(ranks)), varnames = c("row", "col"))
+      dist_df = rbind(dist_df, dist_hold)
+    }
+  }
+  
+  #remove self-comparisons
+  dist_df = dist_df[dist_df$value > 0,]
+  
+  #get minimum of each gene to make tandem/proximal classifications
+  dist_min = dist_df %>%
+    group_by(row) %>%
+    summarise(drank_min = min(value))
+  
+  #identify tandem (drank_min == 1) and proximal (1 < drank_min <= 20)
+  dist_min$dup_class = NA
+  
+  dist_min$dup_class[dist_min$drank_min == 1] = "tandem"
+  dist_min$dup_class[dist_min$drank_min > 1 & dist_min$drank_min <= 20] = "proximal"
+  
+  #get vectors of the two classes and change the df_c dataframe to reflect that
+  prox_vec = dist_min$row[dist_min$dup_class == "proximal"]
+  tand_vec = dist_min$row[dist_min$dup_class == "tandem"]
+  
+  df_c$proximal[df_c$gene %in% prox_vec] = TRUE
+  df_c$tandem[df_c$gene %in% tand_vec] = TRUE
+  df_c$dispersed[df_c$gene %in% prox_vec | df_c$gene %in% tand_vec] = FALSE
+  
+  #export bed file to test MCScanX_h
+  gff_c = df_c[,c(2,1,3,4)]
+  
+  #make pairwise homology file for MCScanX_h
+  hom_c = left_join(orth_c, orth_c, by = "ortho") %>%
+    filter(gene.x != gene.y)
+
+  hom_c = hom_c[hom_c$gene.x %in% df_c$gene,]
+  hom_c = hom_c[hom_c$gene.y %in% df_c$gene,]
+  hom_c = hom_c[,2:3]
+  
+  hom_c$gene.x = paste("dc0|", hom_c$gene.x, sep = "")
+  hom_c$gene.y = paste("dc0|", hom_c$gene.y, sep = "")
+  
+  hom_c$rand = sample(100, size = nrow(hom_c), replace = TRUE)
+    
+  #add appendices for names in both gff and homology files for MCScanX_h to do it's thing
+  gff_c1 = gff_c
+  gff_c1$chrom = paste("dc0_", gff_c1$chrom, sep = "")
+  gff_c1$gene = paste("dc0|", gff_c1$gene, sep = "")
+  
+  #write necessary files to disk
+  dir.create(paste("processed_data/", spec , sep = ""))
+  write.table(df_c, paste("processed_data/duplication_tables/", spec, "_dupnowgd.csv", sep = ""), row.names = FALSE, quote = FALSE)
+  
+  write.table(gff_c1, paste("processed_data/", spec, "/", spec, "_mcscan_input.gff", sep = ""), sep = "\t", col.names = FALSE, row.names = FALSE, quote = FALSE)
+  
+  write.table(hom_c, paste("processed_data/", spec, "/", spec, "_mcscan_input.homology", sep = ""), sep = "\t", col.names = FALSE, row.names = FALSE, quote = FALSE)
+}
+
+for (spec in specs) {
+  spec = gsub("_refseq", "", spec)
+  collinearity = read.table(paste("../GOAL5_duplication_origin_analysis/processed_data/", spec, "/", spec, "_mcscan_input.collinearity", sep = ""), comment.char = "#", sep = "\t")
+  
+  #we only want the gene names so get rid of the other data
+  collinearity = collinearity[,2:3]
+  
+  #correct gene name by removing the "dc0|" filler
+  collinearity$V2 = gsub("dc0\\|", "", collinearity$V2)
+  collinearity$V3 = gsub("dc0\\|", "", collinearity$V3)
+  
+  #get list of colinear genes
+  colinear_genes = unique(c(collinearity$V2, collinearity$V3))
+  
+  #read in the duplication data from before
+  df_c = read.csv(paste("processed_data/duplication_tables/", spec, "_dupnowgd.csv", sep = ""), sep = " ")
+  
+  #if genes are in the colinear gene list, mark them as segmental in the df_c data record that has all the duplication events
+  df_c$segmental = ifelse(df_c$gene %in% colinear_genes, TRUE, FALSE)
+
+  #convert the classifications into numbers so that you can make a max column
+  dup_class = df_c
+
+  dup_class$segmental = ifelse(dup_class$segmental == TRUE, 4, NA)
+  dup_class$tandem = ifelse(dup_class$tandem == TRUE, 3, NA)
+  dup_class$proximal = ifelse(dup_class$proximal == TRUE, 2, NA)
+  dup_class$dispersed = ifelse(dup_class$dispersed == TRUE, 1, NA)
+  dup_class$singleton = ifelse(dup_class$singleton == TRUE, 0, NA)
+
+  dup_class$num_class = pmax(dup_class$singleton, dup_class$dispersed, dup_class$proximal, dup_class$tandem, dup_class$segmental, na.rm = TRUE)
+
+  #what's the distribution of the classes
+  table(dup_class$num_class)
+  table(dup_class$num_class)/sum(table(dup_class$num_class))
+
+  dup_class$myco = ifelse(dup_class$ortho %in% am_ortho$ortho, "AM", "NM")
+
+  #get observed percentages of duplication types in the AM orthogroup
+  am_dup = dup_class[dup_class$myco == "AM",]
+
+  am_obs = table(am_dup$num_class)/sum(table(am_dup$num_class))
+
+  #randomly subsample from whole genome with same number of am_ortho   groups in am_dup
+  null_count = 10000
+  rand_obs = data.frame("0" = rep(NA, null_count),
+                        "1" = rep(NA, null_count),
+                        "2" = rep(NA, null_count),
+                        "3" = rep(NA, null_count),
+                        "4" = rep(NA, null_count))
+
+  for (i in 1:null_count) {
+    hold_ortho = unique(dup_class$ortho)
+    rand_ortho = sample(hold_ortho, length(unique(am_dup$ortho)))
+
+    hold_dup = dup_class[dup_class$ortho %in% rand_ortho,]
+    hold_obs = table(hold_dup$num_class)/sum(table(hold_dup$num_class))
+    names(hold_obs) = paste("X", names(hold_obs), sep = "")
+    rand_obs[i,names(hold_obs)] = hold_obs
+  }
+  
+  colnames(rand_obs) = c("singleton", "dispersed", "proximal", "tandem", "segmental")
+
+  #plot random distributions with observed values for better visualization
+  rand_long = gather(rand_obs, dup_class, proportion, singleton:segmental, factor_key = TRUE)
+  
+  #save to disk for stats later
+  write.csv(rand_long, paste("processed_data/", spec, "_rand-dupevents.csv", sep = ""), quote = FALSE, row.names = FALSE)
+  write.csv(dup_class, paste("processed_data/", spec, "_withwgd.csv", sep = ""), quote = FALSE, row.names = FALSE)
+
+  p = ggplot() +
+      geom_violin(data = rand_long, aes(x = dup_class, y = proportion)) +
+      geom_point(aes(x = 1:5, y = as.vector(am_obs)), size = 3) +
+      ggtitle(spec) +
+      theme_classic()
+  p
+  
+  #ggsave(paste("../temp_images/", spec, ".pdf"), plot = p, device = "pdf")
+}
+```
+```{r}
+#get count of scaffolds per species. Species whose genomes are split over too many scaffolds will not be good for WGD analyses
+#also get observed ratios of duplication origin types from AM orthogroups
+all_am = data.frame("singleton" = rep(NA, length(specs)),
+                    "dispersed" = rep(NA, length(specs)),
+                    "proximal" = rep(NA, length(specs)),
+                    "tandem" = rep(NA, length(specs)),
+                    "segmental" = rep(NA, length(specs)),
+                    "species" = rep(NA, length(specs))
+                    )
+
+scaff_counts = rep(NA, length(specs))
+count = 1
+
+all_rand = data.frame("dup_class" = character(),
+                      "proportion" = numeric(),
+                      "species" = character()
+                      )
+
+for (spec in specs) {
+  spec = gsub("_refseq", "", spec)
+  names(scaff_counts)[count] = spec
+  
+  #read in random observations and append with species names
+  rand_df = read.csv(paste("processed_data/", spec, "_rand-dupevents.csv", sep = ""))
+  rand_df$species = spec
+  all_rand = rbind(all_rand, rand_df)
+  
+  #read in dup_classes to get scaffold counts and am orthogroup proportions of duplication types
+  temp_df = read.csv(paste("processed_data/", spec, "_withwgd.csv", sep = ""))
+  
+  scaff_counts[count] = length(unique(temp_df$chrom))
+  
+  am_dup = temp_df[temp_df$myco == "AM",]
+  all_am[count,1:5] = table(am_dup$num_class)/sum(table(am_dup$num_class))
+  all_am[count, "species"] = spec
+  
+  count = count + 1
+}
+
+#convert all_am to long form
+am_long = gather(all_am, dup_class, proportion, singleton:segmental, factor_key = TRUE)
+
+#some of the values are NAs when they should be 0. Not converting them to 0 and using na.rm = TRUE in mean calculation downstream means dividing over fewer categories rather than the full 5 so you overestimate the mean.
+all_rand = all_rand %>% 
+  replace_na(list(proportion = 0))
+```
+
+```{r}
+#Find cut-off based on histogram of number of scaffolds to find out where outliers really begin
+#I used model species and/or important agricultural crops so the vast majority would have near complete contigs
+hist(scaff_counts, breaks = 30)
+
+#Based on the histogram, 500 scaffolds seems to be a decent cut-off. We can discuss a better cut-off criterion later because even some of the taxa that had more scaffolds had reasonable distributions of duplication types that matched taxa with fewer scaffolds.
+#We lose 8 out of 32 taxa with a cut-off of 500 scaffolds
+scaff_filt = scaff_counts[scaff_counts <= 500]
+
+#filter the observed and random dataframes for these taxa that pass the filter.
+rand_filt = all_rand[all_rand$species %in% names(scaff_filt),]
+am_filt = am_long[am_long$species %in% names(scaff_filt),]
+```
+
+```{r}
+dup_p = data.frame("dup_class" = character(),
+                   "p_value" = numeric(),
+                   "am_observed" = numeric(),
+                   "rand_mean" = numeric(),
+                   "species" = character()
+                   )
+
+count = 1
+
+for (spec in names(scaff_filt)) {
+  obs_spec = am_filt[am_filt$species == spec,] %>%
+    group_by(dup_class)
+  rand_spec = rand_filt[rand_filt$species == spec,] %>%
+    group_by(dup_class)
+  
+  #absolute difference from random mean for all random values
+  rand_bin = rand_spec %>% 
+    summarise(delta_diff = abs(proportion - mean(proportion)))
+  
+  for (i in unique(rand_bin$dup_class)) {
+    am_observed = obs_spec[obs_spec$dup_class == i, ]$proportion
+    rand_mean = mean(rand_spec[rand_spec$dup_class == i, ]$proportion)
+    
+    dup_p[count, "dup_class"] = i
+    dup_p[count, "species"] = spec
+    dup_p[count, "rand_mean"] = rand_mean
+    dup_p[count, "am_observed"] = am_observed
+    
+    
+    dup_p[count, "p_value"] = sum(rand_bin[rand_bin$dup_class == i,]$delta_diff > abs(am_observed - rand_mean))/null_count
+    
+    count = count + 1
+  }
+}
+```
+
+```{r}
+#prettier plotting
+(p3 = ggplot(dup_p, aes(species, p_value)) +
+  geom_point(aes(fill = am_observed - rand_mean), color = "black", shape = 21, size = 2) +
+  scale_fill_gradient2(midpoint = 0, low = "red", mid = "white", high = "blue") +
+  facet_grid(vars(dup_class)) +
+  theme_test() +
+  geom_hline(yintercept = .05/24, linetype = "dashed") +
+  scale_x_discrete(guide = guide_axis(angle = 90))
+)
+
+dup_p_filt = dup_p[dup_p$dup_class != "singleton",]
+dup_p_filt$dup_class = factor(dup_p_filt$dup_class, levels = c("tandem", "proximal", "segmental", "dispersed"))
+
+(p3 = ggplot(dup_p_filt, aes(p_value, am_observed-rand_mean)) +
+  geom_point(aes(alpha = p_value <= .05/24), color = "#f59761") +
+  scale_alpha_discrete(range = c(.2, 1)) +
+  facet_wrap(vars(dup_class), ncol = 4) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_x_continuous(guide = guide_axis(angle = 90))
+)
+```
+
+```{r}
+#identify significant groupings
+dup_p$significant = dup_p$p_value <= 0.05/length(unique(dup_p$species))
+
+#add significance variable to the all_rand dataframe so that you can highlight which results were significant
+all_rand_comb = merge(all_rand, dup_p, by = c("dup_class", "species"))
+all_rand_comb = all_rand_comb[all_rand_comb$dup_class != "singleton",]
+
+all_rand_comb$dup_class = factor(all_rand_comb$dup_class, levels = c("tandem", "proximal", "segmental", "dispersed"))
+
+species_names = all_rand_comb %>%
+  separate_wider_delim(species, delim = "_", names = c(NA, "genus", "spec"))
+
+species_names = species_names[,c("genus", "spec")]
+species_names$genus = capitalize(species_names$genus)
+all_rand_comb$species_names = paste(species_names$genus, species_names$spec, sep = " ")
+
+am_long = merge(am_long, dup_p, by = c("dup_class", "species"))
+
+#prettier plotting of random distributions
+(p4 = ggplot(all_rand_comb, aes(species, proportion)) +
+  geom_violin(aes(alpha = significant), fill = "#f59761") +
+  geom_point(data = am_long[(am_long$species %in% unique(all_rand_comb$species)) & (am_long$dup_class != "singleton"),], aes(species, proportion, alpha = significant), size = 2) +
+  scale_alpha_discrete(range = c(.2, 1)) +
+  facet_grid(rows = vars(dup_class), scales = "free") +
+  theme_classic() +
+  theme(legend.position = "none") +
+  scale_x_discrete(guide = guide_axis(angle = 90), breaks = unique(all_rand_comb$species), labels = unique(all_rand_comb$species_names)) +
+  theme(axis.text.x = element_text(face = "italic")) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.01)))
+```
+

@@ -1,0 +1,8 @@
+Please be aware that we are not including the raw SNP data available through the Medicago HapMap project.
+We can provide it upon a request if the HapMap project is no longer available. We just did not want to add superfluous data to the Zenodo servers if the data is already readily available elsewhere.
+
+We also are not including the filtered SNP data for a similar reason since this is also easily obtained from the raw data.
+The files are several 100 Gbs and it seems excessive to place on a public repository.
+We provide the scripts for processing the raw data into readable formats for input starting all the way from the raw SNP data in the Medicago HapMap.
+
+We apologize for the inconvenience.
